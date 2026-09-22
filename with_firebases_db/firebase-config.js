@@ -25,5 +25,5 @@ export const firebaseConfig = {
    rules won't let you become an admin. Keep the two in sync.
    ============================================================ */
 export const ADMIN_EMAILS = [
-  "put-your-email@gmail.com",   // <-- CHANGE THIS to your real email
+  "put-your-chavanaboinasathvika@gmail.com",   // <-- CHANGE THIS to your real email
 ];
