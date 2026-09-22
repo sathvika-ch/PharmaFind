@@ -23,7 +23,7 @@ service cloud.firestore {
 
     // 🔽🔽 CHANGE THIS to your real email (match firebase-config.js) 🔽🔽
     function adminEmails() {
-      return ['put-your-email@gmail.com'];
+      return ['chavanaboinasathvika@gmail.com'];
     }
 
     function signedIn() { return request.auth != null; }
