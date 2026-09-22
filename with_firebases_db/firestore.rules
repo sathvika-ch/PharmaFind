@@ -1,0 +1,122 @@
+rules_version = '2';
+
+/* ============================================================
+   PharmaFind — Firestore security rules
+   ------------------------------------------------------------
+   These are the REAL access control. Your JavaScript checks
+   ("only a pharmacy can edit its own inventory") are just UI —
+   anyone can bypass them with the console. THESE rules are what
+   actually protect the data, so they must stand on their own.
+
+   Design note: to keep rules fast and simple, ownership is
+   DENORMALIZED onto the documents themselves —
+     • inventory docs carry  ownerUserId  (the pharmacy owner's uid)
+     • bills docs carry       ownerUserId
+     • reservations carry     pharmacyOwnerId  and  patientId
+   This lets a rule check ownership without an extra get() lookup,
+   which is both cheaper and needed for real-time list queries.
+
+   HOW TO APPLY:
+     Firebase console → Firestore Database → Rules → paste → Publish.
+     (Do this AFTER running seed.html once — see that file.)
+   ============================================================ */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    /* ---------- users ----------
+       A person can read their own profile. Admins read everyone.
+       A new patient/pharmacy may create ONLY their own doc.
+       Admins may create any account (incl. other admins) and may
+       edit or delete accounts. Nobody sets themselves to admin. */
+    match /users/{uid} {
+      allow read:   if request.auth.uid == uid || isAdmin();
+      allow create: if isAdmin()
+                    || (request.auth.uid == uid
+                        && request.resource.data.role in ['patient', 'pharmacy']);
+      allow update, delete: if isAdmin();
+    }
+
+    /* ---------- medicines ----------
+       Public catalog: anyone can read. Only admins edit it. */
+    match /medicines/{id} {
+      allow read:  if true;
+      allow write: if isAdmin();
+    }
+
+    /* ---------- pharmacies ----------
+       Public read (patients must see approved stores; the app filters
+       to approved). A signed-in user may register a store, but it
+       starts 'pending'. An owner may edit their store's details but
+       CANNOT change its status or transfer ownership — only an admin
+       can approve/suspend. Admins can do anything. */
+    match /pharmacies/{id} {
+      allow read:   if true;
+      allow create: if isAdmin()
+                    || (signedIn()
+                        && request.resource.data.ownerUserId == request.auth.uid
+                        && request.resource.data.status == 'pending');
+      allow update: if isAdmin()
+                    || (resource.data.ownerUserId == request.auth.uid
+                        && request.resource.data.status == resource.data.status
+                        && request.resource.data.ownerUserId == resource.data.ownerUserId);
+      allow delete: if isAdmin();
+    }
+
+    /* ---------- inventory ----------
+       Public read (stock availability is what patients search).
+       Writes only by the owning pharmacy (matched via ownerUserId)
+       or an admin. The billing transaction decrements quantity and
+       is covered by the update rule. */
+    match /inventory/{id} {
+      allow read:   if true;
+      allow create: if isAdmin() || request.resource.data.ownerUserId == request.auth.uid;
+      allow update: if isAdmin() || resource.data.ownerUserId == request.auth.uid;
+      allow delete: if isAdmin() || resource.data.ownerUserId == request.auth.uid;
+    }
+
+    /* ---------- reservations ----------
+       Readable by the patient who made it, the pharmacy that owns it,
+       or an admin. A patient creates it for themselves. The pharmacy
+       (or admin) updates status (fulfilled / cancelled). */
+    match /reservations/{id} {
+      allow read:   if isAdmin()
+                    || resource.data.patientId == request.auth.uid
+                    || resource.data.pharmacyOwnerId == request.auth.uid;
+      allow create: if request.resource.data.patientId == request.auth.uid;
+      allow update: if isAdmin() || resource.data.pharmacyOwnerId == request.auth.uid;
+      allow delete: if isAdmin();
+    }
+
+    /* ---------- bills ----------
+       A bill is a permanent record. The owning pharmacy or an admin
+       can read it; nobody may edit or delete it once written. */
+    match /bills/{id} {
+      allow read:   if isAdmin() || resource.data.ownerUserId == request.auth.uid;
+      allow create: if request.resource.data.ownerUserId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    /* ---------- notifications ----------
+       You read and clear your own. Any signed-in user may create one
+       for another user (a patient notifies a pharmacy of a reservation,
+       etc.). In production you'd move notification-creation into a
+       Cloud Function so clients can't spam arbitrary users. */
+    match /notifications/{id} {
+      allow read:   if isAdmin() || resource.data.userId == request.auth.uid;
+      allow create: if signedIn();
+      allow update: if resource.data.userId == request.auth.uid;
+      allow delete: if isAdmin() || resource.data.userId == request.auth.uid;
+    }
+  }
+}

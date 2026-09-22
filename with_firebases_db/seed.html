@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PharmaFind — Seed demo data</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    max-width:640px; margin:40px auto; padding:0 20px; color:#17211d; line-height:1.5}
+  h1{font-size:22px} code{background:#eef2ef; padding:1px 6px; border-radius:5px}
+  button{font:inherit; font-weight:600; padding:11px 18px; border-radius:9px; border:none;
+    background:#0f8a6f; color:#fff; cursor:pointer}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  #log{margin-top:20px; background:#0e1512; color:#c9e5db; padding:16px; border-radius:10px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; white-space:pre-wrap;
+    max-height:50vh; overflow:auto; min-height:60px}
+  .note{background:#fbeed9; border:1px solid #e7cfa0; padding:12px 14px; border-radius:10px; font-size:14px}
+</style>
+</head>
+<body>
+  <h1>✚ PharmaFind — one-time data seeder</h1>
+  <p>This creates the four demo Auth accounts and fills Firestore with the same
+     sample catalog, pharmacies and stock the old <code>localStorage</code> demo had.</p>
+
+  <div class="note">
+    <b>Before you click:</b> your Firestore rules must be open. In the Firebase
+    console → Firestore → Rules, temporarily use test mode:<br>
+    <code>allow read, write: if true;</code><br>
+    Run the seed once, then paste the real <code>firestore.rules</code> and Publish.
+  </div>
+
+  <p style="margin-top:20px"><button id="go">Seed demo data</button></p>
+  <div id="log">Ready.</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signOut }
+  from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import { getFirestore, collection, doc, setDoc, addDoc, getDocs }
+  from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { firebaseConfig, emailFor } from "./firebase-config.js";
+
+const app  = initializeApp(firebaseConfig);
+const db   = getFirestore(app);
+// use a secondary app for creating users so we don't thrash a session
+const secApp  = initializeApp(firebaseConfig, "seeder");
+const secAuth = getAuth(secApp);
+
+const logEl = document.getElementById("log");
+const log = (m)=>{ logEl.textContent += "\n"+m; logEl.scrollTop=logEl.scrollHeight; };
+const now = ()=>Date.now();
+
+async function makeAuthUser(username, password){
+  const cred = await createUserWithEmailAndPassword(secAuth, emailFor(username), password);
+  const uid = cred.user.uid;
+  await signOut(secAuth);
+  return uid;
+}
+
+async function seed(){
+  logEl.textContent = "Starting…";
+
+  // 1) Auth accounts (passwords must be ≥ 6 chars for Firebase)
+  const accounts = [
+    { username:"admin",   password:"admin123",   role:"admin",    name:"System Admin" },
+    { username:"medplus", password:"medplus123", role:"pharmacy", name:"Ravi (MedPlus)" },
+    { username:"apollo",  password:"apollo123",  role:"pharmacy", name:"Sana (Apollo)" },
+    { username:"patient", password:"patient123", role:"patient",  name:"Sangeeth" },
+  ];
+  const uid = {};
+  for(const a of accounts){
+    try{
+      uid[a.username] = await makeAuthUser(a.username, a.password);
+      await setDoc(doc(db,"users",uid[a.username]),
+        { role:a.role, name:a.name, username:a.username, createdAt:now() });
+      log(`✅ user: ${a.username} / ${a.password}`);
+    }catch(e){
+      if(e.code==="auth/email-already-in-use"){ log(`⏭  user ${a.username} already exists — skipping`); }
+      else { log(`❌ ${a.username}: ${e.code||e.message}`); }
+    }
+  }
+
+  // 2) Pharmacies (need the owners' uids; skip if that owner wasn't created)
+  const phDocs = {};
+  const addPharmacy = async (key, ownerUsername, data)=>{
+    if(!uid[ownerUsername]){ log(`⏭  pharmacy ${data.name} — owner missing, skipped`); return; }
+    const ref = await addDoc(collection(db,"pharmacies"),
+      { ownerUserId:uid[ownerUsername], ...data, createdAt:now() });
+    phDocs[key] = ref.id;
+    log(`✅ pharmacy: ${data.name} (${data.status})`);
+  };
+  await addPharmacy("ph1","medplus",
+    { name:"MedPlus Pharmacy", address:"Ameerpet, Hyderabad", lat:17.4374, lng:78.4487,
+      hours:"9:00 AM – 10:00 PM", status:"approved" });
+  await addPharmacy("ph2","apollo",
+    { name:"Apollo Pharmacy", address:"Banjara Hills, Hyderabad", lat:17.4126, lng:78.4482,
+      hours:"8:00 AM – 11:00 PM", status:"pending" });
+
+  // 3) Medicine catalog
+  const meds = [
+    ["Dolo 650","Paracetamol 650mg","Micro Labs"],
+    ["Azithromycin 500","Azithromycin 500mg","Cipla"],
+    ["Cetirizine 10","Cetirizine 10mg","Dr. Reddy's"],
+    ["Amoxicillin 500","Amoxicillin 500mg","Sun Pharma"],
+    ["Pantoprazole 40","Pantoprazole 40mg","Alkem"],
+    ["ORS Powder","Oral Rehydration Salts","FDC"],
+    ["Vitamin C 500","Ascorbic Acid 500mg","HealthVit"],
+    ["Metformin 500","Metformin 500mg","USV"],
+    ["Amlodipine 5","Amlodipine 5mg","Torrent"],
+    ["Ibuprofen 400","Ibuprofen 400mg","Abbott"],
+  ];
+  const medId = {};
+  for(const [name,generic,mfr] of meds){
+    const ref = await addDoc(collection(db,"medicines"), { name, generic, mfr });
+    medId[name] = ref.id;
+  }
+  log(`✅ catalog: ${meds.length} medicines`);
+
+  // 4) Inventory for MedPlus (ph1)
+  if(phDocs.ph1 && uid.medplus){
+    const inv = [
+      ["Dolo 650",120,2.5], ["Azithromycin 500",8,14.0], ["Cetirizine 10",0,1.8],
+      ["Pantoprazole 40",45,6.5], ["ORS Powder",60,20.0], ["Vitamin C 500",5,4.2],
+    ];
+    for(const [name,qty,price] of inv){
+      await addDoc(collection(db,"inventory"),
+        { pharmacyId:phDocs.ph1, ownerUserId:uid.medplus, medicineId:medId[name], quantity:qty, price });
+    }
+    log(`✅ inventory: ${inv.length} items at MedPlus`);
+  }
+
+  log("\n🎉 Done. Now paste firestore.rules in the console, Publish, and open index.html.");
+  log("Demo logins → admin/admin123 · medplus/medplus123 · apollo/apollo123 · patient/patient123");
+}
+
+document.getElementById("go").onclick = async (e)=>{
+  e.target.disabled = true;
+  try{ await seed(); }
+  catch(err){ log("❌ FATAL: "+(err.code||err.message)); console.error(err); }
+  e.target.disabled = false;
+};
+</script>
+</body>
+</html>
