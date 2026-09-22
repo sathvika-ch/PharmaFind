@@ -1,8 +1,7 @@
 /* ============================================================
-   firebase-config.js  —  filled in with YOUR project's values.
-   (The apiKey here is safe to keep in your code — Firebase web
-   keys are public by design. Real security comes from
-   firestore.rules, applied in the setup steps.)
+   firebase-config.js  —  your project's values.
+   (The apiKey is safe in client code — real security is in
+   firestore.rules.)
    ============================================================ */
 
 export const firebaseConfig = {
@@ -14,8 +13,17 @@ export const firebaseConfig = {
   appId: "1:938918577503:web:102f7d65c188b059ce62ea",
 };
 
-/* PharmaFind logs users in by a username (e.g. "patient"), but Firebase
-   Auth needs an email. We map one to the other with a fake domain.
-   The domain is never emailed — it just makes a valid, unique email. */
-export const emailFor = (username) =>
-  String(username).trim().toLowerCase() + "@pharmafind.local";
+/* ============================================================
+   ADMIN EMAILS
+   ------------------------------------------------------------
+   Anyone who signs in with an email in this list becomes an ADMIN
+   automatically. Put YOUR real email here (the one you'll sign in
+   with). You can add more than one.
+
+   ⚠️ IMPORTANT: the SAME email(s) must also be written into
+   firestore.rules (there's a matching list there) — otherwise the
+   rules won't let you become an admin. Keep the two in sync.
+   ============================================================ */
+export const ADMIN_EMAILS = [
+  "put-your-email@gmail.com",   // <-- CHANGE THIS to your real email
+];
