@@ -20,6 +20,9 @@ rules_version = '2';
 
    ADMIN BOOTSTRAP: put your email in adminEmails() below — it MUST
    match ADMIN_EMAILS in firebase-config.js (lowercase).
+   Login is email + password WITHOUT email verification, so create
+   the admin account yourself FIRST — Firebase allows only one
+   account per email, so nobody else can claim it after that.
 
    HOW TO APPLY: Firebase console → Firestore Database → Rules →
    paste → Publish.
@@ -39,7 +42,6 @@ service cloud.firestore {
     function isAdminEmail() {
       return signedIn()
         && request.auth.token.email != null
-        && request.auth.token.email_verified == true
         && request.auth.token.email.lower() in adminEmails();
     }
 

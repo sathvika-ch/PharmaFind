@@ -2,7 +2,7 @@
    PharmaFind — app.js
    Medicine availability & pharmacy finder
    Roles: Admin · Pharmacy · Patient
-   Backend: Firebase Auth (passwordless email link) + Cloud Firestore
+   Backend: Firebase Auth (email + password) + Cloud Firestore
    ------------------------------------------------------------
    HOW THE CORE LOGIC WORKS
 
@@ -38,7 +38,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
 
 import {
   getAuth, onAuthStateChanged, signOut,
-  sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink,
+  createUserWithEmailAndPassword, signInWithEmailAndPassword, sendPasswordResetEmail,
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 
 import {
@@ -63,7 +63,6 @@ const isAdminEmail = (email) => adminEmails.includes(String(email || "").trim().
 /* ============================================================
    CONSTANTS
    ============================================================ */
-const EMAIL_KEY = "pf_emailForSignIn";
 const THEME_KEY = "pf_theme";
 const LOW_STOCK = 10;
 const MAX_RESERVE = 50;
@@ -185,10 +184,11 @@ const cache = {
 let listeners      = [];
 let modalOpen      = false;
 let pendingRefresh = false;
-let completingLink = false;
+let signingUp      = false;   // true while a new account + profile is being created
 
 const state = {
   view: null,
+  authMode: "signin",     // "signin" | "signup"
   searchQuery: "",
   billDraft: [],          // [{ invId, qty }]
   loc: null,              // { lat, lng } from GPS, else BASE_LOC
@@ -342,11 +342,14 @@ function setupListeners(){
    SESSION LIFECYCLE
    ============================================================ */
 onAuthStateChanged(auth, async (user) => {
-  if(user){ await routeSignedIn(user); return; }
+  if(user){
+    if(signingUp) return;          // the sign-up handler routes once the profile is saved
+    await routeSignedIn(user);
+    return;
+  }
   ME = null;
   teardownListeners();
-  if(completingLink) renderLoading("Signing you in…");
-  else renderAuth();
+  renderAuth(state.authMode);
 });
 
 async function routeSignedIn(user){
@@ -358,9 +361,7 @@ async function routeSignedIn(user){
     return;
   }
 
-  completingLink = false;
-
-  if(!snap.exists()){ renderProfileSetup(user); return; }
+  if(!snap.exists()){ renderProfileSetup(user); return; }   // account exists but profile wasn't saved
 
   const d = snap.data();
   ME = {
@@ -379,19 +380,16 @@ async function logout(){
   state.searchQuery = "";
   state.billDraft = [];
   state.loc = null;
+  state.authMode = "signin";
   closeModal();
   await signOut(auth);
 }
 
 
 /* ============================================================
-   AUTH SCREENS (email link)
+   AUTH SCREENS (email + password — no email verification)
    ============================================================ */
 const BRAND = `<div class="brand"><span class="mark"><span>✚</span></span> PharmaFind</div>`;
-
-function actionCodeSettings(){
-  return { url: window.location.origin + window.location.pathname, handleCodeInApp: true };
-}
 
 function renderLoading(msg){
   $("root").innerHTML = `
@@ -401,94 +399,211 @@ function renderLoading(msg){
     </div></div>`;
 }
 
-function renderAuth(){
+function authErrorText(e){
+  const map = {
+    "auth/invalid-email":          "That email address doesn't look right.",
+    "auth/missing-password":       "Enter your password.",
+    "auth/invalid-credential":     "Wrong email or password.",
+    "auth/wrong-password":         "Wrong email or password.",
+    "auth/user-not-found":         "No account with that email — create one instead.",
+    "auth/email-already-in-use":   "An account with this email already exists — sign in instead.",
+    "auth/weak-password":          "Password must be at least 6 characters.",
+    "auth/too-many-requests":      "Too many attempts. Wait a minute and try again.",
+    "auth/network-request-failed": "No internet connection.",
+    "auth/operation-not-allowed":  "Email/Password sign-in isn't enabled in Firebase → Authentication → Sign-in method.",
+  };
+  return map[e && e.code] || "Something went wrong. Try again.";
+}
+
+function passwordField(id, label, autocomplete){
+  return `
+    <label class="fld"><span class="lab">${label}</span>
+      <div class="row" style="flex-wrap:nowrap; gap:6px">
+        <input class="input" id="${id}" type="password" autocomplete="${autocomplete}" placeholder="••••••••">
+        <button class="btn sm ghost" type="button" data-eye="${id}" title="Show / hide">👁</button>
+      </div></label>`;
+}
+
+function wireEyes(){
+  $("root").querySelectorAll("[data-eye]").forEach(b => b.onclick = () => {
+    const el = $(b.dataset.eye);
+    el.type = el.type === "password" ? "text" : "password";
+  });
+}
+
+function renderAuth(mode = "signin"){
+  state.authMode = mode;
+  const signup = mode === "signup";
+
   $("root").innerHTML = `
     <div class="auth-wrap">
       <div class="auth-card">
         ${BRAND}
-        <div class="tag">Find medicines in stock near you — sign in with your email, no password needed.</div>
+        <div class="tag">Find medicines in stock near you.</div>
 
-        <label class="fld"><span class="lab">Email address</span>
-          <input class="input" id="au-email" type="email" placeholder="you@example.com" autocomplete="email"></label>
-        <div class="err" id="au-err"></div>
-        <button class="btn primary" id="au-go" style="width:100%">Email me a sign-in link</button>
-
-        <div class="hint">
-          <b>How it works:</b> we email you a secure one-tap link. Open it on this
-          device and you're in. First time? You'll choose <b>patient</b> or
-          <b>pharmacy</b> right after.
+        <div class="seg">
+          <button id="tab-in"  class="${signup ? "" : "active"}">Sign in</button>
+          <button id="tab-up"  class="${signup ? "active" : ""}">Create account</button>
         </div>
+
+        ${signup ? `
+          <label class="fld"><span class="lab">Full name</span>
+            <input class="input" id="au-name" placeholder="Your name" autocomplete="name"></label>` : ""}
+
+        <label class="fld"><span class="lab">Email</span>
+          <input class="input" id="au-email" type="email" placeholder="you@example.com" autocomplete="email"></label>
+
+        ${passwordField("au-pass", "Password", signup ? "new-password" : "current-password")}
+
+        ${signup ? `
+          ${passwordField("au-pass2", "Confirm password", "new-password")}
+          <div id="au-rolebox">
+            <label class="fld"><span class="lab">I am a…</span>
+              <select class="input" id="au-role">
+                <option value="patient">Patient — I want to find medicines</option>
+                <option value="pharmacy">Pharmacy — I want to list my store</option>
+              </select></label>
+            <div id="au-ph"></div>
+          </div>
+          <div class="hint" id="au-adminnote" style="display:none; margin:0 0 14px">
+            <b>Admin account.</b> This email is on the admin list, so you'll manage the whole network.</div>` : ""}
+
+        <div class="err" id="au-err"></div>
+        <button class="btn primary" id="au-go" style="width:100%">${signup ? "Create account" : "Sign in"}</button>
+
+        ${signup ? "" : `<p style="text-align:center; margin:14px 0 0">
+          <a href="#" id="au-forgot" style="font-size:13px">Forgot password?</a></p>`}
       </div>
     </div>`;
 
-  const emailEl = $("au-email");
-  const go = () => sendLink(emailEl.value.trim());
-  $("au-go").onclick = go;
-  emailEl.onkeydown = e => { if(e.key === "Enter") go(); };
-  emailEl.focus();
+  $("tab-in").onclick = () => renderAuth("signin");
+  $("tab-up").onclick = () => renderAuth("signup");
+  wireEyes();
+
+  const holder = { loc: null };
+
+  if(signup){
+    const roleSel = $("au-role");
+    const drawPh = () => {
+      $("au-ph").innerHTML = roleSel.value === "pharmacy" ? storeFieldsHtml("au") : "";
+      if(roleSel.value === "pharmacy") wireStoreLocation("au", holder);
+    };
+    roleSel.onchange = drawPh;
+    drawPh();
+
+    // If the typed email is an admin email, hide the role picker
+    $("au-email").oninput = () => {
+      const admin = isAdminEmail($("au-email").value);
+      $("au-rolebox").style.display = admin ? "none" : "";
+      $("au-adminnote").style.display = admin ? "" : "none";
+    };
+    $("au-name").focus();
+  } else {
+    $("au-email").focus();
+    $("au-forgot").onclick = (e) => { e.preventDefault(); forgotPassword(); };
+  }
+
+  const submit = () => signup ? doSignUp(holder) : doSignIn();
+  $("au-go").onclick = submit;
+  $("root").querySelectorAll(".auth-card input").forEach(el => {
+    el.onkeydown = e => { if(e.key === "Enter") submit(); };
+  });
 }
 
-async function sendLink(email){
+async function doSignIn(){
   const err = $("au-err");
   err.textContent = "";
-  if(!/^\S+@\S+\.\S+$/.test(email)){ err.textContent = "Enter a valid email address."; return; }
+  const email = $("au-email").value.trim();
+  const pass  = $("au-pass").value;
+  if(!email || !pass){ err.textContent = "Enter your email and password."; return; }
 
   const btn = $("au-go");
   btn.disabled = true;
-  btn.textContent = "Sending…";
-
+  btn.textContent = "Signing in…";
   try{
-    await sendSignInLinkToEmail(auth, email, actionCodeSettings());
-    lsSet(EMAIL_KEY, email);
-    renderCheckInbox(email);
+    await signInWithEmailAndPassword(auth, email, pass);
+    // onAuthStateChanged takes it from here
   }catch(e){
     console.error(e);
-    err.textContent =
-      e.code === "auth/unauthorized-continue-uri" ? "This web address isn't in Firebase → Authentication → Settings → Authorized domains yet." :
-      e.code === "auth/operation-not-allowed"     ? "Email-link sign-in isn't enabled in Firebase → Authentication → Sign-in method." :
-      e.code === "auth/quota-exceeded"            ? "Daily email limit reached. Try again tomorrow." :
-      "Could not send the link. Check the email and try again.";
+    err.textContent = authErrorText(e);
     btn.disabled = false;
-    btn.textContent = "Email me a sign-in link";
+    btn.textContent = "Sign in";
   }
 }
 
-function renderCheckInbox(email){
-  $("root").innerHTML = `
-    <div class="auth-wrap">
-      <div class="auth-card" style="text-align:center">
-        ${BRAND}
-        <div style="font-size:40px; margin:16px 0 6px">📧</div>
-        <h3>Check your inbox</h3>
-        <p class="tag" style="margin-top:8px">We sent a sign-in link to<br><b>${esc(email)}</b></p>
-        <p style="font-size:13px; color:var(--muted); margin-top:14px">
-          Open it on <b>this device</b>. Can't find it? Check spam or promotions.</p>
-        <button class="btn" id="ci-back" style="width:100%; margin-top:18px">Use a different email</button>
-      </div>
-    </div>`;
-  $("ci-back").onclick = renderAuth;
-}
+async function doSignUp(holder){
+  const err = $("au-err");
+  err.textContent = "";
 
-async function handleEmailLinkReturn(){
-  if(!isSignInWithEmailLink(auth, window.location.href)) return;
+  const name  = $("au-name").value.trim();
+  const email = $("au-email").value.trim().toLowerCase();
+  const pass  = $("au-pass").value;
+  const pass2 = $("au-pass2").value;
+  const admin = isAdminEmail(email);
+  const role  = admin ? "admin" : $("au-role").value;
 
-  completingLink = true;
-  renderLoading("Signing you in…");
+  if(!name){ err.textContent = "Please enter your name."; return; }
+  if(!/^\S+@\S+\.\S+$/.test(email)){ err.textContent = "Enter a valid email address."; return; }
+  if(pass.length < 6){ err.textContent = "Password must be at least 6 characters."; return; }
+  if(pass !== pass2){ err.textContent = "Passwords don't match."; return; }
 
-  let email = lsGet(EMAIL_KEY);
-  if(!email) email = window.prompt("Please confirm your email to finish signing in:") || "";
+  const store = role === "pharmacy" ? readStoreFields("au", name, holder) : null;
+
+  const btn = $("au-go");
+  btn.disabled = true;
+  btn.textContent = "Creating account…";
+
+  signingUp = true;
+  let cred;
+  try{
+    cred = await createUserWithEmailAndPassword(auth, email, pass);
+  }catch(e){
+    signingUp = false;
+    console.error(e);
+    err.textContent = authErrorText(e);
+    btn.disabled = false;
+    btn.textContent = "Create account";
+    return;
+  }
 
   try{
-    await signInWithEmailLink(auth, email, window.location.href);
-    lsDel(EMAIL_KEY);
+    await setDoc(doc(db, "users", cred.user.uid), {
+      role, name, email, phone: "", address: "", createdAt: now(),
+    });
+    if(store) await createStore(cred.user.uid, store);
+    toast("Account created — welcome!", "good");
   }catch(e){
     console.error(e);
-    completingLink = false;
-    toast("That sign-in link is invalid or expired. Please request a new one.", "bad");
-    renderAuth();
+    toast(e.code === "permission-denied" && role === "admin"
+      ? "Admin email mismatch — add it to adminEmails() in firestore.rules."
+      : "Account created, but saving your profile failed. Finish it on the next screen.", "bad");
   }finally{
-    window.history.replaceState({}, document.title, window.location.pathname);
+    signingUp = false;
   }
+  await routeSignedIn(cred.user);
+}
+
+function forgotPassword(){
+  const typed = $("au-email") ? $("au-email").value.trim() : "";
+  openModal(`
+    <h3>Reset password</h3>
+    <p class="sub">We'll send a reset link to your email.</p>
+    <label class="fld"><span class="lab">Email</span>
+      <input class="input" id="fp-email" type="email" value="${esc(typed)}"></label>
+    <div class="err" id="fp-err"></div>
+    <div class="row" style="justify-content:flex-end">
+      <button class="btn ghost" data-close>Cancel</button>
+      <button class="btn primary" id="fp-go">Send reset link</button>
+    </div>`);
+  $("fp-go").onclick = async () => {
+    const email = $("fp-email").value.trim();
+    if(!email){ $("fp-err").textContent = "Enter your email."; return; }
+    try{
+      await sendPasswordResetEmail(auth, email);
+      closeModal();
+      toast("If that account exists, a reset link is on its way.", "good");
+    }catch(e){ $("fp-err").textContent = authErrorText(e); }
+  };
 }
 
 
@@ -2226,14 +2341,14 @@ function viewAdAccounts(){
   }).join("");
 
   $("main").innerHTML = `
-    <div class="page-head"><h2>Accounts</h2><p>Everyone on the system. People onboard themselves with an email link.</p></div>
+    <div class="page-head"><h2>Accounts</h2><p>Everyone on the system. People create their own accounts from the sign-in screen.</p></div>
     <div class="table-wrap"><table>
       <thead><tr><th>Name</th><th>Role</th><th>Email</th><th>Phone</th><th>Store</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
     <div class="hint">
       <b>Making someone an admin:</b> add their email to <code>ADMIN_EMAILS</code> in firebase-config.js
-      <i>and</i> to <code>adminEmails()</code> in firestore.rules, then they sign in fresh.
+      <i>and</i> to <code>adminEmails()</code> in firestore.rules <b>before</b> they create their account.
       Deleting an account removes their profile and data; the email login itself can only be removed
       from the Firebase console (Authentication → Users).
     </div>`;
@@ -2286,4 +2401,3 @@ async function deleteAccount(userId){
    BOOT
    ============================================================ */
 renderLoading("Loading…");
-handleEmailLinkReturn();
