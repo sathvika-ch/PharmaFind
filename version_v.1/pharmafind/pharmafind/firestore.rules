@@ -1,0 +1,217 @@
+rules_version = '2';
+
+/* ============================================================
+   PharmaFind — Firestore security rules
+   ------------------------------------------------------------
+   These are the REAL access control. The JavaScript checks in the
+   app are only UI — THESE rules protect the data.
+
+   Key guarantees
+   • A reservation can only be created TOGETHER with the matching
+     stock reduction on that inventory row (same transaction), for
+     the correct pharmacy owner, at the real price.
+   • A patient may only touch inventory to (a) hold stock for their
+     own new reservation or (b) return stock when cancelling their
+     own pending reservation — and only by exactly that quantity.
+   • Inventory can only be listed under a pharmacy you own that is
+     approved.
+   • Notifications can only be sent to yourself, by an admin, or
+     between the patient and pharmacy of a shared reservation.
+
+   ADMIN BOOTSTRAP: put your email in adminEmails() below — it MUST
+   match ADMIN_EMAILS in firebase-config.js (lowercase).
+
+   HOW TO APPLY: Firebase console → Firestore Database → Rules →
+   paste → Publish.
+   ============================================================ */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 🔽 keep identical to ADMIN_EMAILS in firebase-config.js 🔽
+    function adminEmails() {
+      return ['chavanaboinasathvika@gmail.com'];
+    }
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function isAdminEmail() {
+      return signedIn()
+        && request.auth.token.email != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email.lower() in adminEmails();
+    }
+
+    function path(col, id) { return /databases/$(database)/documents/$(col)/$(id); }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(path('users', uid()))
+        && get(path('users', uid())).data.role == 'admin';
+    }
+
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    /* ---------- users ---------- */
+    match /users/{userId} {
+      allow read:   if signedIn() && (uid() == userId || isAdmin());
+      allow create: if isAdmin()
+                    || (signedIn() && uid() == userId && (
+                          request.resource.data.role in ['patient', 'pharmacy']
+                          || (request.resource.data.role == 'admin' && isAdminEmail())
+                       ));
+      allow update: if isAdmin()
+                    || (signedIn() && uid() == userId
+                        && !changed().hasAny(['role', 'email']));
+      allow delete: if isAdmin();
+    }
+
+    /* ---------- medicines (public catalog) ---------- */
+    match /medicines/{id} {
+      allow read:  if true;
+      allow write: if isAdmin();
+    }
+
+    /* ---------- pharmacies ---------- */
+    match /pharmacies/{id} {
+      allow read:   if true;
+      allow create: if isAdmin()
+                    || (signedIn()
+                        && request.resource.data.ownerUserId == uid()
+                        && request.resource.data.status == 'pending');
+      allow update: if isAdmin()
+                    || (signedIn()
+                        && resource.data.ownerUserId == uid()
+                        && !changed().hasAny(['status', 'ownerUserId', 'approvedAt']));
+      allow delete: if isAdmin();
+    }
+
+    /* ---------- inventory ---------- */
+    function ownsApprovedPharmacy(phId) {
+      let ph = get(path('pharmacies', phId)).data;
+      return ph.ownerUserId == uid() && ph.status == 'approved';
+    }
+
+    // Patient holds stock for a brand-new reservation (same transaction).
+    function isHold(invId) {
+      let resId = request.resource.data.lastHold;
+      let r = getAfter(path('reservations', resId)).data;
+      return changed().hasOnly(['quantity', 'lastHold'])
+        && !exists(path('reservations', resId))
+        && r.patientId == uid()
+        && r.inventoryId == invId
+        && r.status == 'pending'
+        && request.resource.data.quantity == resource.data.quantity - r.qty
+        && request.resource.data.quantity >= 0;
+    }
+
+    // Patient returns stock when cancelling their own pending reservation.
+    function isRelease(invId) {
+      let resId = request.resource.data.lastHold;
+      let before = get(path('reservations', resId)).data;
+      let after = getAfter(path('reservations', resId)).data;
+      return changed().hasOnly(['quantity', 'lastHold'])
+        && before.patientId == uid()
+        && before.inventoryId == invId
+        && before.status == 'pending'
+        && after.status == 'cancelled'
+        && request.resource.data.quantity == resource.data.quantity + before.qty;
+    }
+
+    match /inventory/{id} {
+      allow read:   if true;
+      allow create: if isAdmin()
+                    || (signedIn()
+                        && request.resource.data.ownerUserId == uid()
+                        && ownsApprovedPharmacy(request.resource.data.pharmacyId)
+                        && request.resource.data.quantity is int
+                        && request.resource.data.quantity >= 0
+                        && request.resource.data.price is number
+                        && request.resource.data.price >= 0);
+      allow update: if isAdmin()
+                    || (signedIn() && resource.data.ownerUserId == uid()
+                        && !changed().hasAny(['ownerUserId', 'pharmacyId', 'medicineId'])
+                        && request.resource.data.quantity is int
+                        && request.resource.data.quantity >= 0)
+                    || (signedIn() && request.resource.data.get('lastHold', null) is string && isHold(id))
+                    || (signedIn() && request.resource.data.get('lastHold', null) is string && isRelease(id));
+      allow delete: if isAdmin() || (signedIn() && resource.data.ownerUserId == uid());
+    }
+
+    /* ---------- reservations ---------- */
+    function validNewReservation(resId) {
+      let d = request.resource.data;
+      let inv = get(path('inventory', d.inventoryId)).data;
+      let invAfter = getAfter(path('inventory', d.inventoryId)).data;
+      let ph = get(path('pharmacies', d.pharmacyId)).data;
+      return d.patientId == uid()
+        && d.status == 'pending'
+        && d.paid == true
+        && d.qty is int && d.qty >= 1 && d.qty <= 50
+        && inv.pharmacyId == d.pharmacyId
+        && inv.medicineId == d.medicineId
+        && ph.status == 'approved'
+        && ph.ownerUserId == d.pharmacyOwnerId
+        && d.amountPaid is number
+        && math.abs(d.amountPaid - inv.price * d.qty) < 0.01
+        && invAfter.quantity == inv.quantity - d.qty
+        && invAfter.lastHold == resId;
+    }
+
+    function statusMove(from, to) {
+      return resource.data.status == from && request.resource.data.status == to;
+    }
+
+    match /reservations/{id} {
+      allow read:   if signedIn() && (isAdmin()
+                    || resource.data.patientId == uid()
+                    || resource.data.pharmacyOwnerId == uid());
+      allow create: if signedIn() && validNewReservation(id);
+      allow update: if isAdmin()
+                    // pharmacy moves the order along, or cancels it
+                    || (signedIn() && resource.data.pharmacyOwnerId == uid()
+                        && changed().hasOnly(['status', 'updatedAt', 'cancelledBy'])
+                        && (statusMove('pending', 'ready')
+                            || statusMove('ready', 'collected')
+                            || statusMove('pending', 'cancelled')
+                            || statusMove('ready', 'cancelled')))
+                    // patient may cancel only while still pending
+                    || (signedIn() && resource.data.patientId == uid()
+                        && changed().hasOnly(['status', 'updatedAt', 'cancelledBy'])
+                        && statusMove('pending', 'cancelled'));
+      allow delete: if isAdmin();
+    }
+
+    /* ---------- bills (permanent record) ---------- */
+    match /bills/{id} {
+      allow read:   if signedIn() && (isAdmin() || resource.data.ownerUserId == uid());
+      allow create: if signedIn()
+                    && request.resource.data.ownerUserId == uid()
+                    && ownsApprovedPharmacy(request.resource.data.pharmacyId);
+      allow update, delete: if false;
+    }
+
+    /* ---------- notifications ---------- */
+    function viaSharedReservation(refId, target) {
+      let r = get(path('reservations', refId)).data;
+      return (r.patientId == uid() && target == r.pharmacyOwnerId)
+          || (r.pharmacyOwnerId == uid() && target == r.patientId);
+    }
+
+    match /notifications/{id} {
+      allow read:   if signedIn() && (isAdmin() || resource.data.userId == uid());
+      allow create: if signedIn()
+                    && request.resource.data.read == false
+                    && request.resource.data.text is string
+                    && request.resource.data.text.size() <= 300
+                    && (isAdmin()
+                        || request.resource.data.userId == uid()
+                        || (request.resource.data.get('refId', null) is string
+                            && viaSharedReservation(request.resource.data.refId, request.resource.data.userId)));
+      allow update: if signedIn() && resource.data.userId == uid()
+                    && changed().hasOnly(['read']);
+      allow delete: if signedIn() && (isAdmin() || resource.data.userId == uid());
+    }
+  }
+}
