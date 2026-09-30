@@ -44,7 +44,7 @@
     <label for="adm-email">Admin email (from ADMIN_EMAILS in firebase-config.js)</label>
     <input id="adm-email" disabled>
     <label for="adm-pass">Admin password</label>
-    <input id="adm-pass" type="password" placeholder="At least 6 characters">
+    <input id="adm-pass" type="password" placeholder="At least 8 characters, a letter and a number">
     <small>If the admin account doesn't exist yet it's created with this password.
       If it already exists, type its real password.</small>
     <br>
@@ -69,7 +69,7 @@ import {
   getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut,
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
-  getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, query, where,
+  getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, query, where, writeBatch,
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 import { firebaseConfig, ADMIN_EMAILS } from "./firebase-config.js";
 
@@ -102,9 +102,9 @@ const MEDS = [
 
 const ACCOUNTS = {
   medplus: { email: "medplus@pharmafind.test", pass: "medplus123", role: "pharmacy", name: "Ravi (MedPlus)",
-    store: { name: "MedPlus Pharmacy", address: "Ameerpet, Hyderabad", hours: "9:00 AM – 10:00 PM", lat: 17.4374, lng: 78.4487 } },
+    store: { name: "MedPlus Pharmacy", address: "Ameerpet, Hyderabad", hours: "9:00 AM – 10:00 PM", lat: 17.4374, lng: 78.4487, phone: "+91 40 2374 1111" } },
   apollo:  { email: "apollo@pharmafind.test",  pass: "apollo123",  role: "pharmacy", name: "Sana (Apollo)",
-    store: { name: "Apollo Pharmacy", address: "Banjara Hills, Hyderabad", hours: "8:00 AM – 11:00 PM", lat: 17.4126, lng: 78.4482 } },
+    store: { name: "Apollo Pharmacy", address: "Banjara Hills, Hyderabad", hours: "8:00 AM – 11:00 PM", lat: 17.4126, lng: 78.4482, phone: "+91 40 2335 2222" } },
   patient: { email: "patient@pharmafind.test", pass: "patient123", role: "patient",  name: "Sangeeth" },
 };
 
@@ -137,24 +137,37 @@ async function ensureUserDoc(user, role, name){
   const ref = doc(db, "users", user.uid);
   const snap = await getDoc(ref);
   if(snap.exists()){ log(`   ⏭  profile exists (${snap.data().role})`); return; }
-  await setDoc(ref, { role, name, email: user.email.toLowerCase(), phone: "", address: "", createdAt: now() });
+  const profile = { role, name, email: user.email.toLowerCase(), phone: "", address: "", createdAt: now() };
+  if(role === "admin"){
+    // First admin: profile + one-time claim must be written together (rules require it)
+    if((await getDoc(doc(db, "meta", "adminClaim"))).exists())
+      throw new Error("The admin account was already claimed by a different login. Sign in with that admin account instead.");
+    const batch = writeBatch(db);
+    batch.set(ref, profile);
+    batch.set(doc(db, "meta", "adminClaim"), { uid: user.uid });
+    await batch.commit();
+  } else {
+    await setDoc(ref, profile);
+  }
   log(`   ✅ profile saved as ${role}`);
 }
 
 async function ensurePharmacy(uid, store){
   const q = await getDocs(query(collection(db, "pharmacies"), where("ownerUserId", "==", uid)));
   if(!q.empty){ log(`   ⏭  store "${q.docs[0].data().name}" exists`); return q.docs[0].id; }
-  const ref = await addDoc(collection(db, "pharmacies"), {
+  // one store per pharmacy account: document id = owner uid
+  await setDoc(doc(db, "pharmacies", uid), {
     ownerUserId: uid, ...store, locSet: true, status: "pending", createdAt: now(),
   });
   log(`   ✅ store "${store.name}" registered (pending)`);
-  return ref.id;
+  return uid;
 }
 
 async function seed(){
   logEl.textContent = "Starting…";
   const adminPass = $("adm-pass").value;
-  if(adminPass.length < 6) throw new Error("Enter the admin password (at least 6 characters).");
+  if(adminPass.length < 8 || !/[A-Za-z]/.test(adminPass) || !/\d/.test(adminPass))
+    throw new Error("Enter the admin password (at least 8 characters, with a letter and a number).");
 
   const uids = {}, stores = {};
 

@@ -27,6 +27,14 @@
      - Pharmacies set their real store location from Store settings.
        Stores without a location show "distance unknown".
 
+   • LIMITS: a patient can hold at most MAX_ACTIVE_HOLDS reservations
+     at once (tracked in holds/{uid}); unclaimed holds are released
+     after HOLD_HOURS by the pharmacy's / admin's app.
+
+   • ACCOUNTS: first admin is claimed once (meta/adminClaim); more
+     admins via "Make admin". Admins can Block / Remove accounts —
+     removed accounts stay blocked so they can't re-register.
+
    • PAYMENT is a MOCK screen (no real money). A real gateway needs
      a backend (e.g. Cloud Functions + Razorpay).
 
@@ -43,7 +51,7 @@ import {
 
 import {
   getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc,
-  deleteDoc, onSnapshot, query, where, runTransaction,
+  deleteDoc, onSnapshot, query, where, runTransaction, writeBatch,
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
 import { firebaseConfig, ADMIN_EMAILS, DEFAULT_LOCATION } from "./firebase-config.js";
@@ -64,8 +72,13 @@ const isAdminEmail = (email) => adminEmails.includes(String(email || "").trim().
    CONSTANTS
    ============================================================ */
 const THEME_KEY = "pf_theme";
+const LOC_KEY   = "pf_loc";
 const LOW_STOCK = 10;
 const MAX_RESERVE = 50;
+const MAX_ACTIVE_HOLDS = 3;           // must match maxActiveHolds() in firestore.rules
+const HOLD_HOURS = 24;                // unclaimed reservations are released after this
+const HOLD_MS = HOLD_HOURS * 60 * 60 * 1000;
+const MIN_PASSWORD = 8;
 
 const BASE_LOC = {
   lat: DEFAULT_LOCATION?.lat ?? 17.3850,
@@ -94,6 +107,11 @@ const RES_STATUS = {
 };
 const ACTIVE_RES = ["pending", "ready"];
 
+function statusInfo(r){
+  if(r.status === "cancelled" && r.cancelledBy === "expired") return { pill: "cancelled", label: "Expired" };
+  return RES_STATUS[r.status] || { pill: "neutral", label: esc(r.status) };
+}
+
 const ROLE_LABEL = { admin: "Admin", pharmacy: "Pharmacy", patient: "Patient" };
 const ROLE_PILL  = { admin: "neutral", pharmacy: "approved", patient: "pending" };
 
@@ -108,6 +126,8 @@ const esc   = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
 ));
 const shortId = (id) => "#" + String(id).slice(0, 8).toUpperCase();
+const num     = (v) => (typeof v === "number" && isFinite(v)) ? v : null;
+const telHref = (p) => String(p || "").replace(/[^\d+]/g, "").slice(0, 16);
 
 function lsGet(k){ try{ return localStorage.getItem(k); }catch(_){ return null; } }
 function lsSet(k, v){ try{ localStorage.setItem(k, v); }catch(_){} }
@@ -185,18 +205,31 @@ let listeners      = [];
 let modalOpen      = false;
 let pendingRefresh = false;
 let signingUp      = false;   // true while a new account + profile is being created
+let loaded         = {};      // collection key -> true once its first snapshot arrived
+let expiring       = new Set();   // reservation ids being auto-released right now
+let dirty          = new Set();   // input ids the user has typed in since the last navigation
 
 const state = {
   view: null,
   authMode: "signin",     // "signin" | "signup"
   searchQuery: "",
   billDraft: [],          // [{ invId, qty }]
-  loc: null,              // { lat, lng } from GPS, else BASE_LOC
+  loc: loadSavedLoc(),    // { lat, lng } from GPS (remembered), else BASE_LOC
   resTab: "active",       // pharmacy reservations tab
   salesTab: "bills",      // pharmacy sales tab
   orderTab: "active",     // admin orders tab
 };
 
+
+function loadSavedLoc(){
+  try{
+    const v = JSON.parse(localStorage.getItem(LOC_KEY) || "null");
+    return v && num(v.lat) !== null && num(v.lng) !== null ? { lat: v.lat, lng: v.lng } : null;
+  }catch(_){ return null; }
+}
+function saveLoc(loc){
+  try{ loc ? localStorage.setItem(LOC_KEY, JSON.stringify(loc)) : localStorage.removeItem(LOC_KEY); }catch(_){}
+}
 
 /* ---------- Lookups ---------- */
 const getUser    = (id) => cache.users.find(u => u.id === id);
@@ -213,8 +246,20 @@ function unreadCount(){
 function patientLoc(){ return state.loc || BASE_LOC; }
 
 function distanceTo(ph){
-  if(!ph || !ph.locSet || typeof ph.lat !== "number" || typeof ph.lng !== "number") return null;
+  if(!ph || !ph.locSet || num(ph.lat) === null || num(ph.lng) === null) return null;
   return haversineKm(patientLoc(), { lat: ph.lat, lng: ph.lng });
+}
+
+function myActiveHolds(){
+  return ME ? cache.reservations.filter(r => r.patientId === ME.uid && ACTIVE_RES.includes(r.status)).length : 0;
+}
+
+function holdExpiresAt(r){ return (r.createdAt || 0) + HOLD_MS; }
+
+function timeLeft(ms){
+  if(ms <= 0) return "expired";
+  const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000);
+  return h ? `${h}h ${m}m left` : `${m}m left`;
 }
 
 function heldQty(invId){
@@ -237,10 +282,15 @@ function notify(userId, text, refId = null){
    UI HELPERS — toast + modal
    ============================================================ */
 function toast(msg, kind = ""){
+  const box = $("toasts");
+  while(box.children.length > 3) box.firstElementChild.remove();       // max 3 on screen
+  if([...box.children].some(t => t.textContent === msg)) return;      // no duplicates
+  while(box.children.length >= 3) box.firstElementChild.remove();
   const el = document.createElement("div");
   el.className = "toast " + kind;
+  el.setAttribute("role", "status");
   el.textContent = msg;
-  $("toasts").appendChild(el);
+  box.appendChild(el);
   setTimeout(() => {
     el.style.transition = "opacity .3s";
     el.style.opacity = "0";
@@ -291,7 +341,36 @@ function confirmModal({ title, text, okLabel = "Confirm", danger = false }){
 function refresh(){
   if(!ME) return;
   if(modalOpen){ pendingRefresh = true; return; }
+  if(isTyping()){ pendingRefresh = true; return; }   // redraw when they leave the field
   renderApp();
+  autoExpireHolds();
+}
+
+function isTyping(){
+  const a = document.activeElement;
+  return !!(a && $("main") && $("main").contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.id !== "search-in");
+}
+
+// Track which inputs the user changed, so a live redraw can put their text back.
+document.addEventListener("input", (e) => { if(e.target && e.target.id) dirty.add(e.target.id); });
+document.addEventListener("focusout", () => {
+  setTimeout(() => { if(pendingRefresh && !modalOpen && !isTyping()){ pendingRefresh = false; renderApp(); } }, 150);
+});
+
+function captureDirty(){
+  const saved = {};
+  dirty.forEach(id => { const el = $(id); if(el && "value" in el) saved[id] = el.value; });
+  const a = document.activeElement;
+  const focus = a && a.id && dirty.has(a.id) ? { id: a.id, pos: a.selectionStart } : null;
+  return { saved, focus };
+}
+
+function restoreDirty({ saved, focus }){
+  Object.entries(saved).forEach(([id, v]) => { const el = $(id); if(el && "value" in el) el.value = v; });
+  if(focus){
+    const el = $(focus.id);
+    if(el){ el.focus(); try{ el.setSelectionRange(focus.pos, focus.pos); }catch(_){} }
+  }
 }
 
 
@@ -301,18 +380,38 @@ function refresh(){
 function teardownListeners(){
   listeners.forEach(unsub => { try{ unsub(); }catch(_){} });
   listeners = [];
+  loaded = {};
   Object.keys(cache).forEach(k => cache[k] = []);
+}
+
+function allLoaded(){
+  const keys = Object.keys(loaded);
+  return keys.length > 0 && keys.every(k => loaded[k]);
 }
 
 function setupListeners(){
   teardownListeners();
 
   const sub = (q, key) => {
+    loaded[key] = false;
     const unsub = onSnapshot(q,
-      snap => { cache[key] = snap.docs.map(d => ({ id: d.id, ...d.data() })); refresh(); },
-      err  => console.error("listener error [" + key + "]", err));
+      snap => { cache[key] = snap.docs.map(d => ({ id: d.id, ...d.data() })); loaded[key] = true; refresh(); },
+      err  => { console.error("listener error [" + key + "]", err); loaded[key] = true; refresh(); });
     listeners.push(unsub);
   };
+
+  // Watch my own profile: if an admin blocks or removes me, sign out right away.
+  listeners.push(onSnapshot(doc(db, "users", ME.uid), snap => {
+    if(!ME) return;
+    if(!snap.exists() || snap.data().blocked){
+      toast("Your account has been blocked by the admin.", "bad");
+      logout();
+      return;
+    }
+    const d = snap.data();
+    if(d.role !== ME.role){ routeSignedIn(auth.currentUser); return; }   // admin changed my role
+    Object.assign(ME, { name: d.name || "", phone: d.phone || "", address: d.address || "" });
+  }, err => console.warn("profile watch", err)));
 
   const mine = (col, field) => query(collection(db, col), where(field, "==", ME.uid));
 
@@ -364,6 +463,7 @@ async function routeSignedIn(user){
   if(!snap.exists()){ renderProfileSetup(user); return; }   // account exists but profile wasn't saved
 
   const d = snap.data();
+  if(d.blocked){ renderBlocked(); return; }
   ME = {
     uid: user.uid, role: d.role, name: d.name || "",
     email: d.email || user.email, phone: d.phone || "", address: d.address || "",
@@ -375,11 +475,55 @@ async function routeSignedIn(user){
   renderApp();
 }
 
+function renderBlocked(){
+  ME = null;
+  teardownListeners();
+  $("root").innerHTML = `
+    <div class="auth-wrap"><div class="auth-card" style="text-align:center">
+      ${BRAND}
+      <div style="font-size:40px; margin:16px 0 6px">⛔</div>
+      <h3>Account blocked</h3>
+      <p class="tag" style="margin-top:8px">This account has been blocked by the PharmaFind admin.
+        If you think this is a mistake, contact the admin.</p>
+      <button class="btn" id="bl-out" style="width:100%">Sign out</button>
+    </div></div>`;
+  $("bl-out").onclick = () => signOut(auth);
+}
+
+/* Saves a new profile. For the admin email this also records the one-time
+   admin claim (meta/adminClaim) in the same batch, as the rules require. */
+async function saveNewProfile(user, role, name){
+  const email = String(user.email || "").toLowerCase();
+  const profile = { role, name, email, phone: "", address: "", createdAt: now() };
+  if(role !== "admin"){
+    await setDoc(doc(db, "users", user.uid), profile);
+    return;
+  }
+  const claim = await getDoc(doc(db, "meta", "adminClaim"));
+  if(claim.exists()) throw Object.assign(new Error("admin-claimed"), { code: "admin-claimed" });
+  const batch = writeBatch(db);
+  batch.set(doc(db, "users", user.uid), profile);
+  batch.set(doc(db, "meta", "adminClaim"), { uid: user.uid });
+  await batch.commit();
+}
+
+function profileErrorText(e, role){
+  if(e.code === "admin-claimed") return "The admin account has already been claimed. Ask the existing admin to give you access.";
+  if(e.code === "permission-denied" && role === "admin") return "Admin email mismatch — this email must also be in adminEmails() in firestore.rules.";
+  return "Saving your profile failed. Try again.";
+}
+
+function passwordProblem(pass){
+  if(pass.length < MIN_PASSWORD) return `Password must be at least ${MIN_PASSWORD} characters.`;
+  if(!/[A-Za-z]/.test(pass) || !/\d/.test(pass)) return "Password must include at least one letter and one number.";
+  return "";
+}
+
 async function logout(){
   state.view = null;
   state.searchQuery = "";
   state.billDraft = [];
-  state.loc = null;
+  state.loc = loadSavedLoc();      // location belongs to the device, keep it
   state.authMode = "signin";
   closeModal();
   await signOut(auth);
@@ -454,6 +598,7 @@ function renderAuth(mode = "signin"){
           <input class="input" id="au-email" type="email" placeholder="you@example.com" autocomplete="email"></label>
 
         ${passwordField("au-pass", "Password", signup ? "new-password" : "current-password")}
+        ${signup ? `<p style="font-size:12px; color:var(--muted); margin:-8px 0 14px">At least ${MIN_PASSWORD} characters, with a letter and a number.</p>` : ""}
 
         ${signup ? `
           ${passwordField("au-pass2", "Confirm password", "new-password")}
@@ -535,7 +680,7 @@ async function doSignUp(holder){
   const err = $("au-err");
   err.textContent = "";
 
-  const name  = $("au-name").value.trim();
+  const name  = $("au-name").value.trim().slice(0, 80);
   const email = $("au-email").value.trim().toLowerCase();
   const pass  = $("au-pass").value;
   const pass2 = $("au-pass2").value;
@@ -544,7 +689,8 @@ async function doSignUp(holder){
 
   if(!name){ err.textContent = "Please enter your name."; return; }
   if(!/^\S+@\S+\.\S+$/.test(email)){ err.textContent = "Enter a valid email address."; return; }
-  if(pass.length < 6){ err.textContent = "Password must be at least 6 characters."; return; }
+  const weak = passwordProblem(pass);
+  if(weak){ err.textContent = weak; return; }
   if(pass !== pass2){ err.textContent = "Passwords don't match."; return; }
 
   const store = role === "pharmacy" ? readStoreFields("au", name, holder) : null;
@@ -567,16 +713,12 @@ async function doSignUp(holder){
   }
 
   try{
-    await setDoc(doc(db, "users", cred.user.uid), {
-      role, name, email, phone: "", address: "", createdAt: now(),
-    });
+    await saveNewProfile(cred.user, role, name);
     if(store) await createStore(cred.user.uid, store);
     toast("Account created — welcome!", "good");
   }catch(e){
     console.error(e);
-    toast(e.code === "permission-denied" && role === "admin"
-      ? "Admin email mismatch — add it to adminEmails() in firestore.rules."
-      : "Account created, but saving your profile failed. Finish it on the next screen.", "bad");
+    toast(profileErrorText(e, role) + (e.code === "admin-claimed" ? "" : " Finish it on the next screen."), "bad");
   }finally{
     signingUp = false;
   }
@@ -618,6 +760,8 @@ function storeFieldsHtml(prefix){
       <input class="input" id="${prefix}-phaddr" placeholder="e.g. Kukatpally, Hyderabad"></label>
     <label class="fld"><span class="lab">Opening hours</span>
       <input class="input" id="${prefix}-phhours" placeholder="e.g. 9:00 AM – 9:00 PM"></label>
+    <label class="fld"><span class="lab">Store phone (shown to patients)</span>
+      <input class="input" id="${prefix}-phphone" type="tel" placeholder="e.g. +91 40 1234 5678" maxlength="20"></label>
     <div class="row" style="margin-bottom:14px">
       <button class="btn sm" id="${prefix}-loc" type="button">📍 Use my current location for the store</button>
       <span id="${prefix}-locmsg" style="font-size:12.5px; color:var(--muted)">Optional — you can set it later.</span>
@@ -637,17 +781,19 @@ function wireStoreLocation(prefix, holder){
 
 function readStoreFields(prefix, fallbackName, holder){
   return {
-    name:    $(prefix + "-phname").value.trim()  || fallbackName + "'s Pharmacy",
-    address: $(prefix + "-phaddr").value.trim()  || "Hyderabad",
-    hours:   $(prefix + "-phhours").value.trim() || "9:00 AM – 9:00 PM",
+    name:    ($(prefix + "-phname").value.trim()  || fallbackName + "'s Pharmacy").slice(0, 80),
+    address: ($(prefix + "-phaddr").value.trim()  || "Hyderabad").slice(0, 160),
+    hours:   ($(prefix + "-phhours").value.trim() || "9:00 AM – 9:00 PM").slice(0, 60),
+    phone:   $(prefix + "-phphone").value.trim().slice(0, 20),
     lat:     holder.loc ? holder.loc.lat : BASE_LOC.lat,
     lng:     holder.loc ? holder.loc.lng : BASE_LOC.lng,
     locSet:  !!holder.loc,
   };
 }
 
+// One store per pharmacy account: the store's document id IS the owner's uid.
 async function createStore(uid, fields){
-  return addDoc(collection(db, "pharmacies"), {
+  return setDoc(doc(db, "pharmacies", uid), {
     ownerUserId: uid, ...fields, status: "pending", createdAt: now(),
   });
 }
@@ -711,17 +857,13 @@ function renderProfileSetup(user){
     btn.textContent = "Creating…";
 
     try{
-      await setDoc(doc(db, "users", user.uid), {
-        role, name, email: String(user.email).toLowerCase(), phone: "", address: "", createdAt: now(),
-      });
+      await saveNewProfile(user, role, name.slice(0, 80));
       if(store) await createStore(user.uid, store);
       await routeSignedIn(user);
       toast("Account created — welcome!", "good");
     }catch(e){
       console.error(e);
-      err.textContent = (e.code === "permission-denied" && role === "admin")
-        ? "Admin email mismatch — this email must also be in adminEmails() in firestore.rules."
-        : "Could not create your account. Try again.";
+      err.textContent = profileErrorText(e, role);
       btn.disabled = false;
       btn.textContent = "Create my account";
     }
@@ -774,7 +916,7 @@ function navCount(v){
   return 0;
 }
 
-function go(view){ state.view = view; renderApp(); }
+function go(view){ state.view = view; dirty.clear(); renderApp(); }
 
 function renderApp(){
   if(!ME){ renderAuth(); return; }
@@ -788,16 +930,17 @@ function renderApp(){
   }).join("");
 
   const unread = unreadCount();
+  const keep = captureDirty();
 
   $("root").innerHTML = `
     <div class="topbar">
       ${BRAND}
       <span class="role-chip">${ROLE_LABEL[ME.role] || ME.role}</span>
       <div class="spacer"></div>
-      <button class="icon-btn" id="btn-theme" title="Toggle theme">${currentThemeIsDark() ? "☀️" : "🌙"}</button>
-      <button class="icon-btn" id="btn-notif" title="Notifications">🔔${unread ? `<span class="badge-dot">${unread}</span>` : ""}</button>
+      <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle light or dark theme">${currentThemeIsDark() ? "☀️" : "🌙"}</button>
+      <button class="icon-btn" id="btn-notif" title="Notifications" aria-label="Notifications${unread ? `, ${unread} unread` : ""}">🔔${unread ? `<span class="badge-dot" aria-hidden="true">${unread}</span>` : ""}</button>
       <div class="who"><b>${esc(ME.name)}</b><span class="sub">${esc(ME.email)}</span></div>
-      <button class="icon-btn" id="btn-logout" title="Sign out">⏻</button>
+      <button class="icon-btn" id="btn-logout" title="Sign out" aria-label="Sign out">⏻</button>
     </div>
     <div class="app">
       <aside class="side">
@@ -812,7 +955,15 @@ function renderApp(){
   $("btn-notif").onclick  = openNotifications;
   $("btn-theme").onclick  = toggleTheme;
 
+  // Until every live collection has sent its first data, show a loader —
+  // never a misleading "empty" screen (which could, e.g., offer "Register my store").
+  if(!allLoaded()){
+    $("main").innerHTML = `<div class="empty" style="margin-top:40px"><div class="big">⏳</div><h3>Loading your data…</h3></div>`;
+    return;
+  }
+
   renderView();
+  restoreDirty(keep);
 }
 
 function renderView(){
@@ -947,13 +1098,23 @@ function searchRows(q){
   return rows;
 }
 
+function mapLink(ph){
+  const lat = num(ph.lat), lng = num(ph.lng);
+  const q = (ph.locSet && lat !== null && lng !== null)
+    ? `${lat},${lng}`
+    : encodeURIComponent(`${ph.name || ""} ${ph.address || ""}`);
+  return "https://www.google.com/maps/search/?api=1&query=" + q;
+}
+
+function phoneLink(ph){
+  const t = telHref(ph && ph.phone);
+  return t ? `<a href="tel:${esc(t)}">📞 ${esc(ph.phone)}</a>` : "";
+}
+
 function resultCard(r){
   const ss = stockState(r.inv.quantity);
   const canReserve = r.inv.quantity > 0;
   const dist = r.dist === null ? "distance unknown" : `${r.dist.toFixed(1)} km`;
-  const mapUrl = r.ph.locSet
-    ? `https://www.google.com/maps/search/?api=1&query=${r.ph.lat},${r.ph.lng}`
-    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(r.ph.name + " " + r.ph.address)}`;
 
   return `
     <div class="result">
@@ -964,62 +1125,76 @@ function resultCard(r){
         <div class="meta">
           <span>📍 ${dist} · ${esc(r.ph.address)}</span>
           <span>🕒 ${esc(r.ph.hours)}</span>
-          <a href="${mapUrl}" target="_blank" rel="noopener">Directions ↗</a>
+          ${phoneLink(r.ph)}
+          <a href="${esc(mapLink(r.ph))}" target="_blank" rel="noopener noreferrer">Directions ↗</a>
         </div>
       </div>
       <div class="right">
         <div class="price">${money(r.inv.price)}</div>
         <span class="pill ${ss.key}">${ss.label}${canReserve ? ` · ${r.inv.quantity}` : ""}</span>
-        <button class="btn ${canReserve ? "primary" : ""} sm" data-reserve="${r.inv.id}" ${canReserve ? "" : "disabled"}>
+        <button class="btn ${canReserve ? "primary" : ""} sm" data-reserve="${esc(r.inv.id)}" ${canReserve ? "" : "disabled"}>
           ${canReserve ? "Reserve & pay" : "Unavailable"}</button>
       </div>
     </div>`;
 }
 
-function viewSearch(){
+function searchResultsHtml(){
   const q = state.searchQuery.trim().toLowerCase();
-  let resultsHtml;
-
   if(!q){
-    resultsHtml = `
+    return `
       <div class="empty"><div class="big">💊</div>
         <h3>Search for a medicine</h3>
         <p>Type a brand or generic name — e.g. <b>Dolo</b>, <b>Paracetamol</b>, <b>Azithromycin</b>.</p></div>`;
-  } else {
-    const rows = searchRows(q);
-    resultsHtml = rows.length
-      ? `<p style="color:var(--muted); font-size:13px; margin:0 0 10px">${rows.length} result${rows.length !== 1 ? "s" : ""} · in stock first, then nearest</p>`
-        + rows.map(resultCard).join("")
-      : `<div class="empty"><div class="big">😕</div>
-          <h3>No pharmacy has "${esc(state.searchQuery)}" listed</h3>
-          <p>Try another name or the generic salt — stock updates live as pharmacies bill and restock.</p></div>`;
   }
+  const rows = searchRows(q);
+  return rows.length
+    ? `<p style="color:var(--muted); font-size:13px; margin:0 0 10px">${rows.length} result${rows.length !== 1 ? "s" : ""} · in stock first, then nearest</p>`
+      + rows.map(resultCard).join("")
+    : `<div class="empty"><div class="big">😕</div>
+        <h3>No pharmacy has "${esc(state.searchQuery)}" listed</h3>
+        <p>Try another name or the generic salt — stock updates live as pharmacies bill and restock.</p></div>`;
+}
 
+function renderSearchResults(){
+  const box = $("search-results");
+  if(!box) return;
+  box.innerHTML = searchResultsHtml();
+  box.querySelectorAll("[data-reserve]").forEach(b => b.onclick = () => reserveMedicine(b.dataset.reserve));
+}
+
+let searchTimer = null;
+
+function viewSearch(){
+  const holds = myActiveHolds();
   const locText = state.loc
     ? `📍 Using your location (${state.loc.lat.toFixed(3)}, ${state.loc.lng.toFixed(3)})`
     : `📍 Distances from ${esc(BASE_LOC.label)}`;
 
   $("main").innerHTML = `
     <div class="page-head"><h2>Find medicine</h2>
-      <p>Live stock from approved pharmacies. Reserving holds the medicine for you.</p></div>
+      <p>Live stock from approved pharmacies. Reserving holds the medicine for you for ${HOLD_HOURS} hours.</p></div>
     <div class="card" style="padding:14px; margin-bottom:18px">
       <div class="row">
-        <input class="input grow" id="search-in" placeholder="Search a medicine — name or salt…" value="${esc(state.searchQuery)}">
+        <input class="input grow" id="search-in" type="search" aria-label="Search a medicine"
+          placeholder="Search a medicine — name or salt…" value="${esc(state.searchQuery)}" autocomplete="off">
         <button class="btn primary" id="search-go">Search</button>
       </div>
       <div class="locbar">
         <span>${locText}</span>
         <button class="btn sm ghost" id="loc-btn">${state.loc ? "Refresh location" : "Use my location"}</button>
         ${state.loc ? `<button class="btn sm ghost" id="loc-reset">Reset</button>` : ""}
+        <span style="margin-left:auto">🏷️ Active reservations: <b>${holds}/${MAX_ACTIVE_HOLDS}</b></span>
       </div>
     </div>
-    <div id="search-results">${resultsHtml}</div>`;
+    <div id="search-results"></div>`;
+
+  renderSearchResults();
 
   const inEl = $("search-in");
-  const run = () => { state.searchQuery = inEl.value; viewSearch(); };
+  const run = () => { clearTimeout(searchTimer); state.searchQuery = inEl.value; renderSearchResults(); };
   $("search-go").onclick = run;
   inEl.onkeydown = e => { if(e.key === "Enter") run(); };
-  if(q){ inEl.focus(); inEl.setSelectionRange(inEl.value.length, inEl.value.length); }
+  inEl.oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(run, 250); };   // live search
 
   $("loc-btn").onclick = async () => {
     const b = $("loc-btn");
@@ -1027,14 +1202,13 @@ function viewSearch(){
     b.textContent = "Locating…";
     try{
       state.loc = await getBrowserLocation();
-      toast("Location updated — sorting by real distance.", "good");
+      saveLoc(state.loc);
+      toast("Location saved — sorting by real distance.", "good");
     }catch(e){ toast(e.message, "bad"); }
     viewSearch();
   };
   const lr = $("loc-reset");
-  if(lr) lr.onclick = () => { state.loc = null; viewSearch(); };
-
-  $("main").querySelectorAll("[data-reserve]").forEach(b => b.onclick = () => reserveMedicine(b.dataset.reserve));
+  if(lr) lr.onclick = () => { state.loc = null; saveLoc(null); viewSearch(); };
 }
 
 
@@ -1046,6 +1220,10 @@ function reserveMedicine(invId){
   if(!inv || inv.quantity <= 0){ toast("That item just went out of stock.", "bad"); viewSearch(); return; }
   const med = getMed(inv.medicineId), ph = getPh(inv.pharmacyId);
   if(!med || !ph){ toast("That listing is no longer available.", "bad"); return; }
+  if(myActiveHolds() >= MAX_ACTIVE_HOLDS){
+    toast(`You can have at most ${MAX_ACTIVE_HOLDS} active reservations. Collect or cancel one first.`, "bad");
+    return;
+  }
 
   const max = Math.min(inv.quantity, MAX_RESERVE);
 
@@ -1138,15 +1316,20 @@ function openPayment(invId, med, ph, qty){
 
     try{
       await runTransaction(db, async (tx) => {
-        const invRef = doc(db, "inventory", invId);
+        const invRef   = doc(db, "inventory", invId);
+        const holdsRef = doc(db, "holds", ME.uid);
         const s = await tx.get(invRef);
+        const h = await tx.get(holdsRef);
         if(!s.exists()) throw new Error("This item is no longer listed.");
         const d = s.data();
         if(d.quantity < qty) throw new Error(d.quantity > 0 ? `Only ${d.quantity} left now.` : "It just went out of stock.");
+        const activeNow = h.exists() ? (h.data().active || 0) : 0;
+        if(activeNow >= MAX_ACTIVE_HOLDS) throw new Error(`You already have ${MAX_ACTIVE_HOLDS} active reservations.`);
 
         paid = d.price * qty;
 
         tx.update(invRef, { quantity: d.quantity - qty, lastHold: resRef.id });
+        tx.set(holdsRef, { active: activeNow + 1, lastRes: resRef.id });
         tx.set(resRef, {
           patientId: ME.uid, patientName: ME.name, patientPhone: ME.phone || "",
           pharmacyId: d.pharmacyId, pharmacyOwnerId: ph.ownerUserId,
@@ -1196,6 +1379,14 @@ function showPaymentReceipt({ id, paymentRef, total, med, ph, qty }){
    ============================================================ */
 
 /* Cancel + return the held quantity to stock, atomically. */
+/* Reads the patient's hold counter (inside a transaction) so we can give one back. */
+async function readHolds(tx, patientId){
+  const ref = doc(db, "holds", patientId);
+  const snap = await tx.get(ref);
+  return { ref, active: snap.exists() ? (snap.data().active || 0) : 0 };
+}
+
+/* Cancel + return the held quantity to stock + free the patient's hold — atomically. */
 async function cancelReservation(resId, allowedFrom, byRole){
   let r;
   await runTransaction(db, async (tx) => {
@@ -1207,9 +1398,11 @@ async function cancelReservation(resId, allowedFrom, byRole){
 
     const invRef = doc(db, "inventory", r.inventoryId);
     const is = await tx.get(invRef);
+    const holds = await readHolds(tx, r.patientId);
 
     tx.update(rRef, { status: "cancelled", cancelledBy: byRole, updatedAt: now() });
     if(is.exists()) tx.update(invRef, { quantity: is.data().quantity + r.qty, lastHold: resId });
+    if(holds.active >= 1) tx.update(holds.ref, { active: holds.active - 1, lastRes: resId });
   });
   return r;
 }
@@ -1222,9 +1415,32 @@ async function setReservationStatus(resId, from, to){
     if(!rs.exists()) throw new Error("Reservation not found.");
     r = { id: rs.id, ...rs.data() };
     if(r.status !== from) throw new Error("This reservation was already updated.");
+    const freesHold = ACTIVE_RES.includes(from) && !ACTIVE_RES.includes(to);
+    const holds = freesHold ? await readHolds(tx, r.patientId) : null;
+
     tx.update(rRef, { status: to, updatedAt: now() });
+    if(holds && holds.active >= 1) tx.update(holds.ref, { active: holds.active - 1, lastRes: resId });
   });
   return r;
+}
+
+/* Releases reservations nobody collected within HOLD_HOURS. Runs in the
+   pharmacy's and admin's app whenever their data refreshes. (Fully automatic
+   release while nobody is online needs a Cloud Function — see notes.) */
+function autoExpireHolds(){
+  if(!ME || (ME.role !== "pharmacy" && ME.role !== "admin")) return;
+  const cutoff = now() - HOLD_MS;
+  cache.reservations
+    .filter(r => ACTIVE_RES.includes(r.status) && (r.createdAt || 0) < cutoff && !expiring.has(r.id))
+    .filter(r => ME.role === "admin" || r.pharmacyOwnerId === ME.uid)
+    .forEach(async r => {
+      expiring.add(r.id);
+      try{
+        await cancelReservation(r.id, ACTIVE_RES, "expired");
+        notify(r.patientId, `Your reservation for ${medName(r.medicineId)} expired after ${HOLD_HOURS} hours and was released. A refund has been initiated (demo).`, ME.role === "admin" ? null : r.id);
+      }catch(e){ console.warn("auto-expire failed", r.id, e); }
+      finally{ expiring.delete(r.id); }
+    });
 }
 
 
@@ -1239,13 +1455,15 @@ function viewPatientReservations(){
       <thead><tr><th>Medicine</th><th>Pharmacy</th><th>Qty</th><th>Paid</th><th>Status</th><th>When</th><th></th></tr></thead>
       <tbody>${mine.map(r => {
         const ph = getPh(r.pharmacyId);
-        const st = RES_STATUS[r.status] || { pill: "neutral", label: r.status };
+        const st = statusInfo(r);
         return `<tr>
           <td><b>${esc(getMed(r.medicineId)?.name || "—")}</b><br><small style="color:var(--faint)">${shortId(r.id)}</small></td>
-          <td>${esc(ph ? ph.name : "—")}${ph ? `<br><small style="color:var(--muted)">${esc(ph.address)}</small>` : ""}</td>
+          <td>${esc(ph ? ph.name : "—")}${ph ? `<br><small style="color:var(--muted)">${esc(ph.address)}</small>` : ""}
+            ${ph && ph.phone ? `<br><small>${phoneLink(ph)}</small>` : ""}</td>
           <td>${r.qty}</td>
           <td><span class="pill ok">${money(r.amountPaid)}</span></td>
-          <td><span class="pill ${st.pill}">${st.label}</span></td>
+          <td><span class="pill ${st.pill}">${st.label}</span>
+            ${ACTIVE_RES.includes(r.status) ? `<br><small style="color:var(--muted)">⏳ ${timeLeft(holdExpiresAt(r) - now())}</small>` : ""}</td>
           <td style="color:var(--muted)">${timeAgo(r.createdAt)}</td>
           <td class="actions">${r.status === "pending" ? `<button class="btn sm danger" data-pcancel="${r.id}">Cancel</button>` : ""}</td>
         </tr>`;
@@ -1259,7 +1477,8 @@ function viewPatientReservations(){
 
   $("main").innerHTML = `
     <div class="page-head"><h2>My reservations</h2>
-      <p>Medicines you've paid for and the pharmacy is holding.</p></div>
+      <p>Medicines you've paid for and the pharmacy is holding. You can have ${MAX_ACTIVE_HOLDS} active at a time;
+        each is held for ${HOLD_HOURS} hours, then released automatically.</p></div>
     ${ready ? `<div class="card" style="margin-bottom:16px; border-color:var(--info)">
       <b>🎉 ${ready} reservation${ready > 1 ? "s are" : " is"} ready for pickup.</b>
       <span style="color:var(--muted)"> Show the reservation ID at the counter.</span></div>` : ""}
@@ -1793,7 +2012,7 @@ function viewPhReservations(){
     <div class="table-wrap"><table>
       <thead><tr><th>Medicine</th><th>Patient</th><th>Qty</th><th>Paid</th><th>Status</th><th>When</th><th></th></tr></thead>
       <tbody>${list.map(r => {
-        const st = RES_STATUS[r.status] || { pill: "neutral", label: r.status };
+        const st = statusInfo(r);
         let actions = "—";
         if(r.status === "pending"){
           actions = `<button class="btn sm primary" data-ready="${r.id}">Mark ready</button>
@@ -1937,11 +2156,13 @@ function viewPhSettings(){
       <label class="fld"><span class="lab">Pharmacy name</span><input class="input" id="set-name" value="${esc(ph.name)}"></label>
       <label class="fld"><span class="lab">Address / area</span><input class="input" id="set-addr" value="${esc(ph.address)}"></label>
       <label class="fld"><span class="lab">Opening hours</span><input class="input" id="set-hours" value="${esc(ph.hours)}"></label>
+      <label class="fld"><span class="lab">Store phone (shown to patients)</span>
+        <input class="input" id="set-phone" type="tel" maxlength="20" value="${esc(ph.phone || "")}" placeholder="e.g. +91 40 1234 5678"></label>
 
       <div class="fld" style="margin-bottom:16px">
         <span class="lab" style="font-size:13px; font-weight:600; display:block; margin-bottom:6px">Store location</span>
         <div class="row">
-          <span id="set-locmsg" style="font-size:13px; color:var(--muted)">${ph.locSet
+          <span id="set-locmsg" style="font-size:13px; color:var(--muted)">${ph.locSet && num(ph.lat) !== null && num(ph.lng) !== null
             ? `📍 ${ph.lat.toFixed(5)}, ${ph.lng.toFixed(5)}`
             : "📍 Not set — patients see “distance unknown”."}</span>
           <button class="btn sm" id="set-loc" type="button">Use my current location</button>
@@ -1965,9 +2186,10 @@ function viewPhSettings(){
 
   $("set-save").onclick = async () => {
     const data = {
-      name:    $("set-name").value.trim()  || ph.name,
-      address: $("set-addr").value.trim()  || ph.address,
-      hours:   $("set-hours").value.trim() || ph.hours,
+      name:    ($("set-name").value.trim()  || ph.name).slice(0, 80),
+      address: ($("set-addr").value.trim()  || ph.address).slice(0, 160),
+      hours:   ($("set-hours").value.trim() || ph.hours).slice(0, 60),
+      phone:   $("set-phone").value.trim().slice(0, 20),
     };
     if(newLoc) Object.assign(data, { lat: newLoc.lat, lng: newLoc.lng, locSet: true });
 
@@ -2032,7 +2254,7 @@ async function removePharmacy(p, reasonText){
   const openRes = cache.reservations.filter(r => r.pharmacyId === p.id && ACTIVE_RES.includes(r.status));
   for(const r of openRes){
     try{
-      await updateDoc(doc(db, "reservations", r.id), { status: "cancelled", cancelledBy: "admin", updatedAt: now() });
+      await cancelReservation(r.id, ACTIVE_RES, "admin");
       notify(r.patientId, `Your reservation at ${p.name} was cancelled (store removed). A refund has been initiated (demo).`);
     }catch(e){ console.warn(e); }
   }
@@ -2174,7 +2396,7 @@ function viewAdOrders(){
     <div class="table-wrap"><table>
       <thead><tr><th>ID</th><th>Medicine</th><th>Patient</th><th>Pharmacy</th><th>Paid</th><th>Status</th><th>When</th><th></th></tr></thead>
       <tbody>${list.map(r => {
-        const st = RES_STATUS[r.status] || { pill: "neutral", label: r.status };
+        const st = statusInfo(r);
         return `<tr>
           <td><b>${shortId(r.id)}</b></td>
           <td>${r.qty} × ${esc(medName(r.medicineId))}</td>
@@ -2325,19 +2547,25 @@ function editMedicine(medId){
    ============================================================ */
 function viewAdAccounts(){
   const order = { admin: 0, pharmacy: 1, patient: 2 };
-  const users = [...cache.users].sort((a, b) => (order[a.role] - order[b.role]) || (a.name || "").localeCompare(b.name || ""));
+  const users = [...cache.users].sort((a, b) =>
+    ((a.blocked ? 1 : 0) - (b.blocked ? 1 : 0)) || (order[a.role] - order[b.role]) || (a.name || "").localeCompare(b.name || ""));
 
   const rows = users.map(u => {
     const ph = u.role === "pharmacy" ? cache.pharmacies.find(p => p.ownerUserId === u.id) : null;
-    const store = ph ? `${esc(ph.name)} · <span class="pill ${ph.status}">${ph.status}</span>` : "—";
+    const store = ph ? `${esc(ph.name)} · <span class="pill ${esc(ph.status)}">${esc(ph.status)}</span>` : "—";
     const isMe = u.id === ME.uid;
-    return `<tr>
-      <td><b>${esc(u.name || "—")}</b>${isMe ? ' <span class="pill neutral">you</span>' : ""}</td>
-      <td><span class="pill ${ROLE_PILL[u.role] || "neutral"}">${ROLE_LABEL[u.role] || u.role}</span></td>
+    const actions = isMe ? `<span style="color:var(--faint)">—</span>` : u.blocked
+      ? `<button class="btn sm primary" data-unblock="${esc(u.id)}">Unblock</button>`
+      : `${u.role !== "admin" ? `<button class="btn sm ghost" data-mkadmin="${esc(u.id)}">Make admin</button>` : ""}
+         <button class="btn sm danger" data-block="${esc(u.id)}">Block</button>
+         <button class="btn sm danger" data-delacc="${esc(u.id)}">Remove</button>`;
+    return `<tr style="${u.blocked ? "opacity:.6" : ""}">
+      <td><b>${esc(u.name || "—")}</b>${isMe ? ' <span class="pill neutral">you</span>' : ""}${u.blocked ? ' <span class="pill cancelled">blocked</span>' : ""}</td>
+      <td><span class="pill ${ROLE_PILL[u.role] || "neutral"}">${esc(ROLE_LABEL[u.role] || u.role)}</span></td>
       <td><code>${esc(u.email || "—")}</code></td>
       <td>${esc(u.phone || "—")}</td>
       <td>${store}</td>
-      <td class="actions"><button class="btn sm danger" data-delacc="${u.id}" ${isMe ? "disabled" : ""}>Delete</button></td></tr>`;
+      <td class="actions">${actions}</td></tr>`;
   }).join("");
 
   $("main").innerHTML = `
@@ -2347,52 +2575,88 @@ function viewAdAccounts(){
       <tbody>${rows}</tbody>
     </table></div>
     <div class="hint">
-      <b>Making someone an admin:</b> add their email to <code>ADMIN_EMAILS</code> in firebase-config.js
-      <i>and</i> to <code>adminEmails()</code> in firestore.rules <b>before</b> they create their account.
-      Deleting an account removes their profile and data; the email login itself can only be removed
-      from the Firebase console (Authentication → Users).
+      <b>Block</b> — the person is signed out immediately and can't sign back in to use the app. Reversible.<br>
+      <b>Remove</b> — cancels their open reservations, deletes their store and notifications, and blocks the account
+      (so they can't just sign up again with the same login). The login itself can only be deleted in the
+      Firebase console → Authentication → Users.<br>
+      <b>Make admin</b> — gives full admin rights. The first admin is claimed once by the admin email; every other admin is added here.
     </div>`;
 
+  $("main").querySelectorAll("[data-block]").forEach(b => b.onclick = () => setBlocked(b.dataset.block, true));
+  $("main").querySelectorAll("[data-unblock]").forEach(b => b.onclick = () => setBlocked(b.dataset.unblock, false));
+  $("main").querySelectorAll("[data-mkadmin]").forEach(b => b.onclick = () => makeAdmin(b.dataset.mkadmin));
   $("main").querySelectorAll("[data-delacc]").forEach(b => b.onclick = () => deleteAccount(b.dataset.delacc));
+}
+
+async function setBlocked(userId, blocked){
+  const u = getUser(userId);
+  if(!u || u.id === ME.uid) return;
+  if(blocked){
+    const ok = await confirmModal({
+      title: `Block ${u.name || "this user"}?`,
+      text: "They are signed out right away and can't use the app until you unblock them.",
+      okLabel: "Block", danger: true,
+    });
+    if(!ok) return;
+  }
+  try{
+    await updateDoc(doc(db, "users", userId), { blocked });
+    if(!blocked) notify(userId, "Your account has been unblocked by the admin.");
+    toast(blocked ? `${u.name} blocked.` : `${u.name} unblocked.`, blocked ? "" : "good");
+  }catch(e){ console.error(e); toast("Could not update the account.", "bad"); }
+}
+
+async function makeAdmin(userId){
+  const u = getUser(userId);
+  if(!u) return;
+  const ok = await confirmModal({
+    title: `Make ${u.name || "this user"} an admin?`,
+    text: "They get full control: approvals, accounts, catalog and all reservations.",
+    okLabel: "Make admin", danger: true,
+  });
+  if(!ok) return;
+  try{
+    await updateDoc(doc(db, "users", userId), { role: "admin" });
+    notify(userId, "You are now a PharmaFind admin. Sign in again to see the admin tools.");
+    toast(`${u.name} is now an admin.`, "good");
+  }catch(e){ console.error(e); toast("Could not change the role.", "bad"); }
 }
 
 async function deleteAccount(userId){
   const u = getUser(userId);
   if(!u) return;
-  if(u.id === ME.uid){ toast("You can't delete your own account.", "bad"); return; }
-  if(u.role === "admin" && cache.users.filter(x => x.role === "admin").length <= 1){ toast("Can't delete the only admin.", "bad"); return; }
+  if(u.id === ME.uid){ toast("You can't remove your own account.", "bad"); return; }
 
   const ph = u.role === "pharmacy" ? cache.pharmacies.find(p => p.ownerUserId === u.id) : null;
   const ok = await confirmModal({
-    title: `Delete ${u.name || "this user"}'s account?`,
+    title: `Remove ${u.name || "this user"}'s account?`,
     text: ph
-      ? `This also removes their store "${ph.name}", its inventory, and cancels its open reservations.`
-      : "Their open reservations are cancelled and the stock returned to pharmacies.",
-    okLabel: "Delete account", danger: true,
+      ? `Removes their store "${ph.name}" and its inventory, cancels its open reservations, and blocks the account.`
+      : "Cancels their open reservations (stock goes back), deletes their notifications, and blocks the account.",
+    okLabel: "Remove account", danger: true,
   });
   if(!ok) return;
 
   try{
     if(ph) await removePharmacy(ph, null);
 
-    if(u.role === "patient"){
-      const open = cache.reservations.filter(r => r.patientId === u.id && ACTIVE_RES.includes(r.status));
-      for(const r of open){
-        try{
-          await cancelReservation(r.id, ACTIVE_RES, "admin");
-          notify(r.pharmacyOwnerId, `Reservation ${shortId(r.id)} was cancelled (patient account removed). Stock returned.`);
-        }catch(e){ console.warn(e); }
-      }
+    const open = cache.reservations.filter(r => r.patientId === u.id && ACTIVE_RES.includes(r.status));
+    for(const r of open){
+      try{
+        await cancelReservation(r.id, ACTIVE_RES, "admin");
+        notify(r.pharmacyOwnerId, `Reservation ${shortId(r.id)} was cancelled (patient account removed). Stock returned.`);
+      }catch(e){ console.warn(e); }
     }
 
     const notifSnap = await getDocs(query(collection(db, "notifications"), where("userId", "==", userId)));
     await Promise.all(notifSnap.docs.map(d => deleteDoc(d.ref).catch(() => {})));
 
-    await deleteDoc(doc(db, "users", userId));
-    toast("Account deleted.");
+    // Keep a blocked stub instead of deleting — otherwise they could sign in and re-register.
+    await updateDoc(doc(db, "users", userId), { blocked: true, deleted: true, phone: "", address: "" });
+    toast("Account removed and blocked.");
   }catch(e){
     console.error(e);
-    toast("Could not delete account completely.", "bad");
+    toast("Could not remove the account completely.", "bad");
   }
 }
 

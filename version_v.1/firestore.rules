@@ -1,31 +1,31 @@
 rules_version = '2';
 
 /* ============================================================
-   PharmaFind — Firestore security rules
+   PharmaFind — Firestore security rules  (v3, hardened)
    ------------------------------------------------------------
    These are the REAL access control. The JavaScript checks in the
    app are only UI — THESE rules protect the data.
 
-   Key guarantees
-   • A reservation can only be created TOGETHER with the matching
-     stock reduction on that inventory row (same transaction), for
-     the correct pharmacy owner, at the real price.
-   • A patient may only touch inventory to (a) hold stock for their
-     own new reservation or (b) return stock when cancelling their
-     own pending reservation — and only by exactly that quantity.
-   • Inventory can only be listed under a pharmacy you own that is
-     approved.
-   • Notifications can only be sent to yourself, by an admin, or
-     between the patient and pharmacy of a shared reservation.
-
-   ADMIN BOOTSTRAP: put your email in adminEmails() below — it MUST
-   match ADMIN_EMAILS in firebase-config.js (lowercase).
-   Login is email + password WITHOUT email verification, so create
-   the admin account yourself FIRST — Firebase allows only one
-   account per email, so nobody else can claim it after that.
+   What they guarantee
+   • ADMIN: the admin email can claim admin exactly ONCE (the claim
+     is recorded in meta/adminClaim). After that nobody else can,
+     even with that email. More admins are added by an admin.
+   • BLOCKED users (users/{uid}.blocked == true) cannot create
+     anything and cannot unblock themselves.
+   • STORES: one store per pharmacy account (doc id = owner uid),
+     only accounts with role "pharmacy", lat/lng must be numbers.
+   • STOCK: a reservation is only accepted together with the exact
+     stock reduction, the real price, the patient's real name, and
+     +1 on the patient's active-hold counter (max 3 at a time).
+     Every way a reservation ends (cancel / collect) must give the
+     hold back (-1). Patients can only move stock by exactly the
+     reserved quantity.
+   • BILLS can't be edited or deleted.
+   • NOTIFICATIONS only to yourself, from an admin, or between the
+     two parties of a shared reservation.
 
    HOW TO APPLY: Firebase console → Firestore Database → Rules →
-   paste → Publish.
+   paste this WHOLE file → Publish.
    ============================================================ */
 
 service cloud.firestore {
@@ -36,8 +36,15 @@ service cloud.firestore {
       return ['chavanaboinasathvika@gmail.com'];
     }
 
+    function maxActiveHolds() { return 3; }
+
+    /* ---------- helpers ---------- */
     function signedIn() { return request.auth != null; }
     function uid() { return request.auth.uid; }
+    function path(col, id) { return /databases/$(database)/documents/$(col)/$(id); }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    function me() { return get(path('users', uid())).data; }
 
     function isAdminEmail() {
       return signedIn()
@@ -45,27 +52,54 @@ service cloud.firestore {
         && request.auth.token.email.lower() in adminEmails();
     }
 
-    function path(col, id) { return /databases/$(database)/documents/$(col)/$(id); }
-
     function isAdmin() {
       return signedIn()
         && exists(path('users', uid()))
-        && get(path('users', uid())).data.role == 'admin';
+        && me().role == 'admin'
+        && me().get('blocked', false) == false;
     }
 
-    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    // Has a profile and is not blocked
+    function active() {
+      return signedIn()
+        && exists(path('users', uid()))
+        && me().get('blocked', false) == false;
+    }
+
+    function nearNow(ms) {
+      return ms is int && math.abs(ms - request.time.toMillis()) < 15 * 60 * 1000;
+    }
+
+    /* ---------- meta/adminClaim (one-time admin bootstrap) ---------- */
+    match /meta/{docId} {
+      allow read: if signedIn();
+      allow create: if docId == 'adminClaim'
+                    && isAdminEmail()
+                    && request.resource.data.uid == uid()
+                    && getAfter(path('users', uid())).data.role == 'admin';
+      allow update, delete: if false;
+    }
 
     /* ---------- users ---------- */
     match /users/{userId} {
       allow read:   if signedIn() && (uid() == userId || isAdmin());
-      allow create: if isAdmin()
-                    || (signedIn() && uid() == userId && (
-                          request.resource.data.role in ['patient', 'pharmacy']
-                          || (request.resource.data.role == 'admin' && isAdminEmail())
-                       ));
-      allow update: if isAdmin()
-                    || (signedIn() && uid() == userId
-                        && !changed().hasAny(['role', 'email']));
+      allow create: if signedIn() && uid() == userId
+                    && request.resource.data.get('blocked', false) == false
+                    && request.resource.data.name is string
+                    && request.resource.data.name.size() <= 80
+                    && (
+                         request.resource.data.role in ['patient', 'pharmacy']
+                         || (request.resource.data.role == 'admin'
+                             && isAdminEmail()
+                             && !exists(path('meta', 'adminClaim'))
+                             && getAfter(path('meta', 'adminClaim')).data.uid == uid())
+                       )
+                    || isAdmin();
+      allow update: if (signedIn() && uid() == userId
+                        && !changed().hasAny(['role', 'email', 'blocked', 'deleted'])
+                        && request.resource.data.name is string
+                        && request.resource.data.name.size() <= 80)
+                    || isAdmin();
       allow delete: if isAdmin();
     }
 
@@ -76,16 +110,30 @@ service cloud.firestore {
     }
 
     /* ---------- pharmacies ---------- */
+    function validStore(d) {
+      return d.name is string && d.name.size() >= 1 && d.name.size() <= 80
+        && d.address is string && d.address.size() <= 160
+        && d.hours is string && d.hours.size() <= 60
+        && d.lat is number && d.lat >= -90 && d.lat <= 90
+        && d.lng is number && d.lng >= -180 && d.lng <= 180
+        && d.get('locSet', false) is bool
+        && d.get('phone', '') is string && d.get('phone', '').size() <= 20;
+    }
+
     match /pharmacies/{id} {
       allow read:   if true;
-      allow create: if isAdmin()
-                    || (signedIn()
+      allow create: if (active()
+                        && id == uid()
+                        && me().role == 'pharmacy'
                         && request.resource.data.ownerUserId == uid()
-                        && request.resource.data.status == 'pending');
-      allow update: if isAdmin()
-                    || (signedIn()
+                        && request.resource.data.status == 'pending'
+                        && validStore(request.resource.data))
+                    || isAdmin();
+      allow update: if (signedIn()
                         && resource.data.ownerUserId == uid()
-                        && !changed().hasAny(['status', 'ownerUserId', 'approvedAt']));
+                        && !changed().hasAny(['status', 'ownerUserId', 'approvedAt'])
+                        && validStore(request.resource.data))
+                    || isAdmin();
       allow delete: if isAdmin();
     }
 
@@ -123,22 +171,60 @@ service cloud.firestore {
 
     match /inventory/{id} {
       allow read:   if true;
-      allow create: if isAdmin()
-                    || (signedIn()
+      allow create: if (active()
                         && request.resource.data.ownerUserId == uid()
                         && ownsApprovedPharmacy(request.resource.data.pharmacyId)
                         && request.resource.data.quantity is int
                         && request.resource.data.quantity >= 0
                         && request.resource.data.price is number
-                        && request.resource.data.price >= 0);
-      allow update: if isAdmin()
-                    || (signedIn() && resource.data.ownerUserId == uid()
+                        && request.resource.data.price >= 0)
+                    || isAdmin();
+      allow update: if (signedIn() && resource.data.ownerUserId == uid()
                         && !changed().hasAny(['ownerUserId', 'pharmacyId', 'medicineId'])
                         && request.resource.data.quantity is int
-                        && request.resource.data.quantity >= 0)
+                        && request.resource.data.quantity >= 0
+                        && request.resource.data.price is number
+                        && request.resource.data.price >= 0)
                     || (signedIn() && request.resource.data.get('lastHold', null) is string && isHold(id))
-                    || (signedIn() && request.resource.data.get('lastHold', null) is string && isRelease(id));
-      allow delete: if isAdmin() || (signedIn() && resource.data.ownerUserId == uid());
+                    || (signedIn() && request.resource.data.get('lastHold', null) is string && isRelease(id))
+                    || isAdmin();
+      allow delete: if (signedIn() && resource.data.ownerUserId == uid()) || isAdmin();
+    }
+
+    /* ---------- holds/{patientId}: active-reservation counter ---------- */
+    function holdForNew(pid) {
+      let rid = request.resource.data.lastRes;
+      return !exists(path('reservations', rid))
+        && getAfter(path('reservations', rid)).data.patientId == pid;
+    }
+
+    function holdForRelease(pid) {
+      let rid = request.resource.data.lastRes;
+      let b = get(path('reservations', rid)).data;
+      let a = getAfter(path('reservations', rid)).data;
+      return b.patientId == pid
+        && b.status in ['pending', 'ready']
+        && a.status in ['collected', 'cancelled'];
+    }
+
+    match /holds/{pid} {
+      allow read:   if signedIn();
+      allow create: if signedIn() && pid == uid()
+                    && request.resource.data.keys().hasOnly(['active', 'lastRes'])
+                    && request.resource.data.active == 1
+                    && holdForNew(pid);
+      allow update: if signedIn()
+                    && request.resource.data.keys().hasOnly(['active', 'lastRes'])
+                    && (
+                         (pid == uid()
+                          && request.resource.data.active == resource.data.active + 1
+                          && request.resource.data.active <= maxActiveHolds()
+                          && holdForNew(pid))
+                      || (resource.data.active >= 1
+                          && request.resource.data.active == resource.data.active - 1
+                          && holdForRelease(pid))
+                       );
+      allow delete: if isAdmin();
     }
 
     /* ---------- reservations ---------- */
@@ -148,8 +234,11 @@ service cloud.firestore {
       let invAfter = getAfter(path('inventory', d.inventoryId)).data;
       let ph = get(path('pharmacies', d.pharmacyId)).data;
       return d.patientId == uid()
+        && me().role == 'patient'
+        && d.patientName == me().name
         && d.status == 'pending'
         && d.paid == true
+        && nearNow(d.createdAt)
         && d.qty is int && d.qty >= 1 && d.qty <= 50
         && inv.pharmacyId == d.pharmacyId
         && inv.medicineId == d.medicineId
@@ -158,39 +247,58 @@ service cloud.firestore {
         && d.amountPaid is number
         && math.abs(d.amountPaid - inv.price * d.qty) < 0.01
         && invAfter.quantity == inv.quantity - d.qty
-        && invAfter.lastHold == resId;
+        && invAfter.lastHold == resId
+        && getAfter(path('holds', uid())).data.lastRes == resId;
     }
 
     function statusMove(from, to) {
       return resource.data.status == from && request.resource.data.status == to;
     }
 
+    // Leaving pending/ready must give the patient's hold back (-1).
+    function holdGivenBack(resId) {
+      let h = path('holds', resource.data.patientId);
+      return !exists(h)
+        || get(h).data.active == 0
+        || (getAfter(h).data.lastRes == resId
+            && getAfter(h).data.active == get(h).data.active - 1);
+    }
+
     match /reservations/{id} {
-      allow read:   if signedIn() && (isAdmin()
-                    || resource.data.patientId == uid()
-                    || resource.data.pharmacyOwnerId == uid());
-      allow create: if signedIn() && validNewReservation(id);
-      allow update: if isAdmin()
-                    // pharmacy moves the order along, or cancels it
-                    || (signedIn() && resource.data.pharmacyOwnerId == uid()
+      allow read:   if signedIn() && (resource.data.patientId == uid()
+                    || resource.data.pharmacyOwnerId == uid()
+                    || isAdmin());
+      allow create: if active() && validNewReservation(id);
+      allow update: if
+                       // pharmacy moves the order along, or cancels it
+                       (signedIn() && resource.data.pharmacyOwnerId == uid()
                         && changed().hasOnly(['status', 'updatedAt', 'cancelledBy'])
                         && (statusMove('pending', 'ready')
-                            || statusMove('ready', 'collected')
-                            || statusMove('pending', 'cancelled')
-                            || statusMove('ready', 'cancelled')))
-                    // patient may cancel only while still pending
+                            || ((statusMove('ready', 'collected')
+                                 || statusMove('pending', 'cancelled')
+                                 || statusMove('ready', 'cancelled'))
+                                && holdGivenBack(id))))
+                       // patient may cancel only while still pending
                     || (signedIn() && resource.data.patientId == uid()
                         && changed().hasOnly(['status', 'updatedAt', 'cancelledBy'])
-                        && statusMove('pending', 'cancelled'));
+                        && statusMove('pending', 'cancelled')
+                        && holdGivenBack(id))
+                    || isAdmin();
       allow delete: if isAdmin();
     }
 
     /* ---------- bills (permanent record) ---------- */
     match /bills/{id} {
-      allow read:   if signedIn() && (isAdmin() || resource.data.ownerUserId == uid());
-      allow create: if signedIn()
+      allow read:   if signedIn() && (resource.data.ownerUserId == uid() || isAdmin());
+      allow create: if active()
                     && request.resource.data.ownerUserId == uid()
-                    && ownsApprovedPharmacy(request.resource.data.pharmacyId);
+                    && ownsApprovedPharmacy(request.resource.data.pharmacyId)
+                    && request.resource.data.items is list
+                    && request.resource.data.items.size() >= 1
+                    && request.resource.data.items.size() <= 50
+                    && request.resource.data.total is number
+                    && request.resource.data.total >= 0
+                    && nearNow(request.resource.data.createdAt);
       allow update, delete: if false;
     }
 
@@ -202,18 +310,18 @@ service cloud.firestore {
     }
 
     match /notifications/{id} {
-      allow read:   if signedIn() && (isAdmin() || resource.data.userId == uid());
-      allow create: if signedIn()
+      allow read:   if signedIn() && (resource.data.userId == uid() || isAdmin());
+      allow create: if active()
                     && request.resource.data.read == false
                     && request.resource.data.text is string
                     && request.resource.data.text.size() <= 300
-                    && (isAdmin()
-                        || request.resource.data.userId == uid()
+                    && (request.resource.data.userId == uid()
                         || (request.resource.data.get('refId', null) is string
-                            && viaSharedReservation(request.resource.data.refId, request.resource.data.userId)));
+                            && viaSharedReservation(request.resource.data.refId, request.resource.data.userId))
+                        || isAdmin());
       allow update: if signedIn() && resource.data.userId == uid()
                     && changed().hasOnly(['read']);
-      allow delete: if signedIn() && (isAdmin() || resource.data.userId == uid());
+      allow delete: if signedIn() && (resource.data.userId == uid() || isAdmin());
     }
   }
 }
