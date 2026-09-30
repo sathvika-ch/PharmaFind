@@ -3,140 +3,232 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PharmaFind — Seed demo data</title>
+<title>PharmaFind — Demo data seeder</title>
 <style>
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-    max-width:640px; margin:40px auto; padding:0 20px; color:#17211d; line-height:1.5}
-  h1{font-size:22px} code{background:#eef2ef; padding:1px 6px; border-radius:5px}
+    max-width:680px; margin:40px auto; padding:0 20px; color:#17211d; line-height:1.5; background:#f4f6f4}
+  h1{font-size:22px; margin-bottom:6px}
+  code{background:#e6ece8; padding:1px 6px; border-radius:5px; font-size:13px}
+  .card{background:#fff; border:1px solid #e0e5e1; border-radius:14px; padding:18px 20px; margin-top:16px}
+  label{display:block; font-size:13px; font-weight:600; margin:10px 0 5px}
+  input{width:100%; padding:10px 12px; border:1px solid #cdd5cf; border-radius:9px; font:inherit; box-sizing:border-box}
   button{font:inherit; font-weight:600; padding:11px 18px; border-radius:9px; border:none;
-    background:#0f8a6f; color:#fff; cursor:pointer}
+    background:#0f8a6f; color:#fff; cursor:pointer; margin-top:14px}
   button:disabled{opacity:.5; cursor:not-allowed}
-  #log{margin-top:20px; background:#0e1512; color:#c9e5db; padding:16px; border-radius:10px;
+  #log{margin-top:16px; background:#0e1512; color:#c9e5db; padding:16px; border-radius:10px;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; white-space:pre-wrap;
-    max-height:50vh; overflow:auto; min-height:60px}
-  .note{background:#fbeed9; border:1px solid #e7cfa0; padding:12px 14px; border-radius:10px; font-size:14px}
+    max-height:55vh; overflow:auto; min-height:60px}
+  .warn{background:#fbe0e0; border:1px solid #f0b4b4; color:#8a1c1c; padding:12px 14px; border-radius:10px; font-size:14px; display:none}
+  table{width:100%; border-collapse:collapse; font-size:14px}
+  td,th{padding:6px 8px; border-bottom:1px solid #e0e5e1; text-align:left}
+  small{color:#5f6d66}
 </style>
 </head>
 <body>
-  <h1>✚ PharmaFind — one-time data seeder</h1>
-  <p>This creates the four demo Auth accounts and fills Firestore with the same
-     sample catalog, pharmacies and stock the old <code>localStorage</code> demo had.</p>
+  <h1>✚ PharmaFind — demo data seeder</h1>
+  <p>Creates demo accounts, the medicine catalog, two pharmacies and stock — matching the
+     current app (email + password login). Works with your normal <code>firestore.rules</code>;
+     no need to open them up. Safe to run more than once: anything that already exists is skipped.</p>
 
-  <div class="note">
-    <b>Before you click:</b> your Firestore rules must be open. In the Firebase
-    console → Firestore → Rules, temporarily use test mode:<br>
-    <code>allow read, write: if true;</code><br>
-    Run the seed once, then paste the real <code>firestore.rules</code> and Publish.
+  <div class="warn" id="filewarn">
+    ⚠️ You opened this file directly (<code>file://</code>). It must be opened through your local
+    server, the same way as the app — e.g. <code>http://localhost:8000/seed.html</code> or, with
+    VS Code Live Server, <code>http://127.0.0.1:5500/seed.html</code>.
+  </div>
+  <script>
+    if(location.protocol === "file:") document.getElementById("filewarn").style.display = "block";
+  </script>
+
+  <div class="card">
+    <b>Admin account</b>
+    <label for="adm-email">Admin email (from ADMIN_EMAILS in firebase-config.js)</label>
+    <input id="adm-email" disabled>
+    <label for="adm-pass">Admin password</label>
+    <input id="adm-pass" type="password" placeholder="At least 6 characters">
+    <small>If the admin account doesn't exist yet it's created with this password.
+      If it already exists, type its real password.</small>
+    <br>
+    <button id="go" disabled>Loading…</button>
   </div>
 
-  <p style="margin-top:20px"><button id="go">Seed demo data</button></p>
+  <div class="card">
+    <b>Demo accounts this creates</b>
+    <table>
+      <tr><th>Role</th><th>Email</th><th>Password</th></tr>
+      <tr><td>Pharmacy (approved)</td><td>medplus@pharmafind.test</td><td>medplus123</td></tr>
+      <tr><td>Pharmacy (pending)</td><td>apollo@pharmafind.test</td><td>apollo123</td></tr>
+      <tr><td>Patient</td><td>patient@pharmafind.test</td><td>patient123</td></tr>
+    </table>
+  </div>
+
   <div id="log">Ready.</div>
 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
-import { getAuth, createUserWithEmailAndPassword, signOut }
-  from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
-import { getFirestore, collection, doc, setDoc, addDoc, getDocs }
-  from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
-import { firebaseConfig, emailFor } from "./firebase-config.js";
+import {
+  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut,
+} from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import {
+  getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, query, where,
+} from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { firebaseConfig, ADMIN_EMAILS } from "./firebase-config.js";
 
 const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
 const db   = getFirestore(app);
-// use a secondary app for creating users so we don't thrash a session
-const secApp  = initializeApp(firebaseConfig, "seeder");
-const secAuth = getAuth(secApp);
 
-const logEl = document.getElementById("log");
-const log = (m)=>{ logEl.textContent += "\n"+m; logEl.scrollTop=logEl.scrollHeight; };
-const now = ()=>Date.now();
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+const log = (m) => { logEl.textContent += "\n" + m; logEl.scrollTop = logEl.scrollHeight; };
+const now = () => Date.now();
 
-async function makeAuthUser(username, password){
-  const cred = await createUserWithEmailAndPassword(secAuth, emailFor(username), password);
-  const uid = cred.user.uid;
-  await signOut(secAuth);
-  return uid;
+const ADMIN_EMAIL = String((ADMIN_EMAILS || [])[0] || "").trim().toLowerCase();
+$("adm-email").value = ADMIN_EMAIL || "(none set in firebase-config.js)";
+$("go").disabled = !ADMIN_EMAIL;
+$("go").textContent = "Seed demo data";
+
+const MEDS = [
+  ["Dolo 650",         "Paracetamol 650mg",      "Micro Labs"],
+  ["Azithromycin 500", "Azithromycin 500mg",     "Cipla"],
+  ["Cetirizine 10",    "Cetirizine 10mg",        "Dr. Reddy's"],
+  ["Amoxicillin 500",  "Amoxicillin 500mg",      "Sun Pharma"],
+  ["Pantoprazole 40",  "Pantoprazole 40mg",      "Alkem"],
+  ["ORS Powder",       "Oral Rehydration Salts", "FDC"],
+  ["Vitamin C 500",    "Ascorbic Acid 500mg",    "HealthVit"],
+  ["Metformin 500",    "Metformin 500mg",        "USV"],
+  ["Amlodipine 5",     "Amlodipine 5mg",         "Torrent"],
+  ["Ibuprofen 400",    "Ibuprofen 400mg",        "Abbott"],
+];
+
+const ACCOUNTS = {
+  medplus: { email: "medplus@pharmafind.test", pass: "medplus123", role: "pharmacy", name: "Ravi (MedPlus)",
+    store: { name: "MedPlus Pharmacy", address: "Ameerpet, Hyderabad", hours: "9:00 AM – 10:00 PM", lat: 17.4374, lng: 78.4487 } },
+  apollo:  { email: "apollo@pharmafind.test",  pass: "apollo123",  role: "pharmacy", name: "Sana (Apollo)",
+    store: { name: "Apollo Pharmacy", address: "Banjara Hills, Hyderabad", hours: "8:00 AM – 11:00 PM", lat: 17.4126, lng: 78.4482 } },
+  patient: { email: "patient@pharmafind.test", pass: "patient123", role: "patient",  name: "Sangeeth" },
+};
+
+const MEDPLUS_STOCK = [
+  ["Dolo 650", 120, 2.5], ["Azithromycin 500", 8, 14], ["Cetirizine 10", 0, 1.8],
+  ["Pantoprazole 40", 45, 6.5], ["ORS Powder", 60, 20], ["Vitamin C 500", 5, 4.2],
+];
+
+/* Sign in, or create the account if it doesn't exist yet. Returns the user. */
+async function signInOrCreate(email, pass){
+  try{
+    return (await signInWithEmailAndPassword(auth, email, pass)).user;
+  }catch(e){
+    if(e.code === "auth/invalid-credential" || e.code === "auth/user-not-found"){
+      try{
+        const u = (await createUserWithEmailAndPassword(auth, email, pass)).user;
+        log(`   ➕ created login ${email}`);
+        return u;
+      }catch(e2){
+        if(e2.code === "auth/email-already-in-use")
+          throw new Error(`${email} already exists with a DIFFERENT password. Use its real password (or delete it in Firebase → Authentication → Users).`);
+        throw e2;
+      }
+    }
+    throw e;
+  }
+}
+
+async function ensureUserDoc(user, role, name){
+  const ref = doc(db, "users", user.uid);
+  const snap = await getDoc(ref);
+  if(snap.exists()){ log(`   ⏭  profile exists (${snap.data().role})`); return; }
+  await setDoc(ref, { role, name, email: user.email.toLowerCase(), phone: "", address: "", createdAt: now() });
+  log(`   ✅ profile saved as ${role}`);
+}
+
+async function ensurePharmacy(uid, store){
+  const q = await getDocs(query(collection(db, "pharmacies"), where("ownerUserId", "==", uid)));
+  if(!q.empty){ log(`   ⏭  store "${q.docs[0].data().name}" exists`); return q.docs[0].id; }
+  const ref = await addDoc(collection(db, "pharmacies"), {
+    ownerUserId: uid, ...store, locSet: true, status: "pending", createdAt: now(),
+  });
+  log(`   ✅ store "${store.name}" registered (pending)`);
+  return ref.id;
 }
 
 async function seed(){
   logEl.textContent = "Starting…";
+  const adminPass = $("adm-pass").value;
+  if(adminPass.length < 6) throw new Error("Enter the admin password (at least 6 characters).");
 
-  // 1) Auth accounts (passwords must be ≥ 6 chars for Firebase)
-  const accounts = [
-    { username:"admin",   password:"admin123",   role:"admin",    name:"System Admin" },
-    { username:"medplus", password:"medplus123", role:"pharmacy", name:"Ravi (MedPlus)" },
-    { username:"apollo",  password:"apollo123",  role:"pharmacy", name:"Sana (Apollo)" },
-    { username:"patient", password:"patient123", role:"patient",  name:"Sangeeth" },
-  ];
-  const uid = {};
-  for(const a of accounts){
-    try{
-      uid[a.username] = await makeAuthUser(a.username, a.password);
-      await setDoc(doc(db,"users",uid[a.username]),
-        { role:a.role, name:a.name, username:a.username, createdAt:now() });
-      log(`✅ user: ${a.username} / ${a.password}`);
-    }catch(e){
-      if(e.code==="auth/email-already-in-use"){ log(`⏭  user ${a.username} already exists — skipping`); }
-      else { log(`❌ ${a.username}: ${e.code||e.message}`); }
-    }
+  const uids = {}, stores = {};
+
+  // 1) Pharmacy + patient accounts — each one writes its OWN data (allowed by the rules)
+  for(const [key, a] of Object.entries(ACCOUNTS)){
+    log(`\n👤 ${a.email}`);
+    const u = await signInOrCreate(a.email, a.pass);
+    uids[key] = u.uid;
+    await ensureUserDoc(u, a.role, a.name);
+    if(a.store) stores[key] = await ensurePharmacy(u.uid, a.store);
+    await signOut(auth);
   }
 
-  // 2) Pharmacies (need the owners' uids; skip if that owner wasn't created)
-  const phDocs = {};
-  const addPharmacy = async (key, ownerUsername, data)=>{
-    if(!uid[ownerUsername]){ log(`⏭  pharmacy ${data.name} — owner missing, skipped`); return; }
-    const ref = await addDoc(collection(db,"pharmacies"),
-      { ownerUserId:uid[ownerUsername], ...data, createdAt:now() });
-    phDocs[key] = ref.id;
-    log(`✅ pharmacy: ${data.name} (${data.status})`);
-  };
-  await addPharmacy("ph1","medplus",
-    { name:"MedPlus Pharmacy", address:"Ameerpet, Hyderabad", lat:17.4374, lng:78.4487,
-      hours:"9:00 AM – 10:00 PM", status:"approved" });
-  await addPharmacy("ph2","apollo",
-    { name:"Apollo Pharmacy", address:"Banjara Hills, Hyderabad", lat:17.4126, lng:78.4482,
-      hours:"8:00 AM – 11:00 PM", status:"pending" });
+  // 2) Admin — catalog, approval, stock
+  log(`\n🛡️  admin ${ADMIN_EMAIL}`);
+  const admin = await signInOrCreate(ADMIN_EMAIL, adminPass);
+  await ensureUserDoc(admin, "admin", "System Admin");
 
-  // 3) Medicine catalog
-  const meds = [
-    ["Dolo 650","Paracetamol 650mg","Micro Labs"],
-    ["Azithromycin 500","Azithromycin 500mg","Cipla"],
-    ["Cetirizine 10","Cetirizine 10mg","Dr. Reddy's"],
-    ["Amoxicillin 500","Amoxicillin 500mg","Sun Pharma"],
-    ["Pantoprazole 40","Pantoprazole 40mg","Alkem"],
-    ["ORS Powder","Oral Rehydration Salts","FDC"],
-    ["Vitamin C 500","Ascorbic Acid 500mg","HealthVit"],
-    ["Metformin 500","Metformin 500mg","USV"],
-    ["Amlodipine 5","Amlodipine 5mg","Torrent"],
-    ["Ibuprofen 400","Ibuprofen 400mg","Abbott"],
-  ];
+  const adminDoc = await getDoc(doc(db, "users", admin.uid));
+  if(adminDoc.data().role !== "admin")
+    throw new Error(`${ADMIN_EMAIL} already has a "${adminDoc.data().role}" profile. Delete that user doc in Firestore, then run again.`);
+
+  // catalog
+  const existing = await getDocs(collection(db, "medicines"));
   const medId = {};
-  for(const [name,generic,mfr] of meds){
-    const ref = await addDoc(collection(db,"medicines"), { name, generic, mfr });
-    medId[name] = ref.id;
+  existing.docs.forEach(d => { medId[d.data().name] = d.id; });
+  let added = 0;
+  for(const [name, generic, mfr] of MEDS){
+    if(medId[name]) continue;
+    medId[name] = (await addDoc(collection(db, "medicines"), { name, generic, mfr })).id;
+    added++;
   }
-  log(`✅ catalog: ${meds.length} medicines`);
+  log(added ? `   ✅ catalog: added ${added} medicines` : `   ⏭  catalog already has these medicines`);
 
-  // 4) Inventory for MedPlus (ph1)
-  if(phDocs.ph1 && uid.medplus){
-    const inv = [
-      ["Dolo 650",120,2.5], ["Azithromycin 500",8,14.0], ["Cetirizine 10",0,1.8],
-      ["Pantoprazole 40",45,6.5], ["ORS Powder",60,20.0], ["Vitamin C 500",5,4.2],
-    ];
-    for(const [name,qty,price] of inv){
-      await addDoc(collection(db,"inventory"),
-        { pharmacyId:phDocs.ph1, ownerUserId:uid.medplus, medicineId:medId[name], quantity:qty, price });
-    }
-    log(`✅ inventory: ${inv.length} items at MedPlus`);
+  // approve MedPlus (Apollo stays pending so you can test Approvals)
+  const mpRef = doc(db, "pharmacies", stores.medplus);
+  if((await getDoc(mpRef)).data().status !== "approved"){
+    await updateDoc(mpRef, { status: "approved", approvedAt: now() });
+    log(`   ✅ MedPlus approved`);
+  } else log(`   ⏭  MedPlus already approved`);
+
+  // stock at MedPlus
+  const inv = await getDocs(query(collection(db, "inventory"), where("pharmacyId", "==", stores.medplus)));
+  const have = new Set(inv.docs.map(d => d.data().medicineId));
+  let stocked = 0;
+  for(const [name, quantity, price] of MEDPLUS_STOCK){
+    if(have.has(medId[name])) continue;
+    await addDoc(collection(db, "inventory"), {
+      pharmacyId: stores.medplus, ownerUserId: uids.medplus, medicineId: medId[name], quantity, price,
+    });
+    stocked++;
   }
+  log(stocked ? `   ✅ MedPlus stock: ${stocked} medicines` : `   ⏭  MedPlus stock already there`);
 
-  log("\n🎉 Done. Now paste firestore.rules in the console, Publish, and open index.html.");
-  log("Demo logins → admin/admin123 · medplus/medplus123 · apollo/apollo123 · patient/patient123");
+  await signOut(auth);
+
+  log("\n🎉 Done! Open the app and sign in with any account above.");
+  log(`   Admin → ${ADMIN_EMAIL} / (the password you typed)`);
+  log("   Try: patient searches 'dolo' → reserves → MedPlus marks it ready.");
+  log("   Apollo is left PENDING so you can approve it as admin.");
 }
 
-document.getElementById("go").onclick = async (e)=>{
+$("go").onclick = async (e) => {
   e.target.disabled = true;
   try{ await seed(); }
-  catch(err){ log("❌ FATAL: "+(err.code||err.message)); console.error(err); }
+  catch(err){
+    console.error(err);
+    const hint =
+      err.code === "permission-denied"        ? "  → Publish the latest firestore.rules, and check the admin email matches in BOTH files." :
+      err.code === "auth/operation-not-allowed" ? "  → Turn on Email/Password in Firebase → Authentication → Sign-in method." :
+      err.code === "auth/network-request-failed" ? "  → No internet connection." : "";
+    log("\n❌ " + (err.message || err.code) + (hint ? "\n" + hint : ""));
+    try{ await signOut(auth); }catch(_){}
+  }
   e.target.disabled = false;
 };
 </script>
