@@ -47,6 +47,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
 import {
   getAuth, onAuthStateChanged, signOut,
   createUserWithEmailAndPassword, signInWithEmailAndPassword, sendPasswordResetEmail,
+  EmailAuthProvider, reauthenticateWithCredential, updatePassword,
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 
 import {
@@ -551,7 +552,10 @@ function authErrorText(e){
     "auth/wrong-password":         "Wrong email or password.",
     "auth/user-not-found":         "No account with that email — create one instead.",
     "auth/email-already-in-use":   "An account with this email already exists — sign in instead.",
-    "auth/weak-password":          "Password must be at least 6 characters.",
+    "auth/weak-password":          "That password is too weak — use at least 8 characters with a letter and a number.",
+    "auth/requires-recent-login":  "For security, sign out and sign in again, then change your password.",
+    "auth/missing-email":          "Enter your email.",
+    "auth/password-does-not-meet-requirements": "That password doesn't meet the password policy. Try a longer one with a letter and a number.",
     "auth/too-many-requests":      "Too many attempts. Wait a minute and try again.",
     "auth/network-request-failed": "No internet connection.",
     "auth/operation-not-allowed":  "Email/Password sign-in isn't enabled in Firebase → Authentication → Sign-in method.",
@@ -728,24 +732,50 @@ async function doSignUp(holder){
 function forgotPassword(){
   const typed = $("au-email") ? $("au-email").value.trim() : "";
   openModal(`
-    <h3>Reset password</h3>
-    <p class="sub">We'll send a reset link to your email.</p>
+    <h3>Forgot password?</h3>
+    <p class="sub">Enter the email you signed up with. We'll email you a link to choose a new password.</p>
     <label class="fld"><span class="lab">Email</span>
-      <input class="input" id="fp-email" type="email" value="${esc(typed)}"></label>
+      <input class="input" id="fp-email" type="email" autocomplete="email" value="${esc(typed)}" placeholder="you@example.com"></label>
     <div class="err" id="fp-err"></div>
     <div class="row" style="justify-content:flex-end">
       <button class="btn ghost" data-close>Cancel</button>
       <button class="btn primary" id="fp-go">Send reset link</button>
     </div>`);
-  $("fp-go").onclick = async () => {
-    const email = $("fp-email").value.trim();
-    if(!email){ $("fp-err").textContent = "Enter your email."; return; }
+  const emailEl = $("fp-email");
+  emailEl.focus();
+
+  const send = async () => {
+    const email = emailEl.value.trim();
+    const err = $("fp-err");
+    err.textContent = "";
+    if(!/^\S+@\S+\.\S+$/.test(email)){ err.textContent = "Enter a valid email address."; return; }
+
+    const btn = $("fp-go");
+    btn.disabled = true;
+    btn.textContent = "Sending…";
     try{
       await sendPasswordResetEmail(auth, email);
-      closeModal();
-      toast("If that account exists, a reset link is on its way.", "good");
-    }catch(e){ $("fp-err").textContent = authErrorText(e); }
+      openModal(`
+        <div style="text-align:center">
+          <div style="font-size:40px; margin-bottom:6px">📧</div>
+          <h3>Check your inbox</h3>
+          <p class="sub" style="margin-top:6px">If an account exists for <b>${esc(email)}</b>, a password-reset link is on its way.</p>
+        </div>
+        <ol style="font-size:13.5px; color:var(--muted); line-height:1.8; padding-left:20px; margin:0 0 16px">
+          <li>Open the email from PharmaFind (check <b>spam / promotions</b> too).</li>
+          <li>Click the link and type your new password.</li>
+          <li>Come back here and sign in with it.</li>
+        </ol>
+        <button class="btn primary" style="width:100%" data-close>Back to sign in</button>`);
+    }catch(e){
+      console.error(e);
+      err.textContent = authErrorText(e);
+      btn.disabled = false;
+      btn.textContent = "Send reset link";
+    }
   };
+  $("fp-go").onclick = send;
+  emailEl.onkeydown = e => { if(e.key === "Enter") send(); };
 }
 
 
@@ -1034,6 +1064,42 @@ function openNotifications(){
 /* ============================================================
    SHARED: profile page (all roles)
    ============================================================ */
+async function changePassword(){
+  const err = $("cp-err");
+  err.textContent = "";
+  const oldPass = $("cp-old").value;
+  const newPass = $("cp-new").value;
+  const newPass2 = $("cp-new2").value;
+
+  if(!oldPass){ err.textContent = "Enter your current password."; return; }
+  const weak = passwordProblem(newPass);
+  if(weak){ err.textContent = weak; return; }
+  if(newPass !== newPass2){ err.textContent = "The new passwords don't match."; return; }
+  if(newPass === oldPass){ err.textContent = "The new password must be different from the current one."; return; }
+
+  const user = auth.currentUser;
+  if(!user){ err.textContent = "You're signed out. Sign in again."; return; }
+
+  const btn = $("cp-save");
+  btn.disabled = true;
+  btn.textContent = "Updating…";
+  try{
+    // Firebase requires proof you know the current password before changing it
+    await reauthenticateWithCredential(user, EmailAuthProvider.credential(user.email, oldPass));
+    await updatePassword(user, newPass);
+    ["cp-old", "cp-new", "cp-new2"].forEach(id => { $(id).value = ""; dirty.delete(id); });
+    toast("Password updated. Use the new one next time you sign in.", "good");
+  }catch(e){
+    console.error(e);
+    err.textContent = (e.code === "auth/invalid-credential" || e.code === "auth/wrong-password")
+      ? "Your current password is wrong."
+      : authErrorText(e);
+  }finally{
+    btn.disabled = false;
+    btn.textContent = "Update password";
+  }
+}
+
 function viewProfile(){
   $("main").innerHTML = `
     <div class="page-head"><h2>My profile</h2><p>Your personal details.</p></div>
@@ -1048,7 +1114,40 @@ function viewProfile(){
         <input class="input" id="pf-addr" value="${esc(ME.address)}" placeholder="Your address / area"></label>
       <div class="err" id="pf-err"></div>
       <button class="btn primary" id="pf-save">Save changes</button>
+    </div>
+
+    <div class="card" style="max-width:520px">
+      <h3 style="margin-bottom:4px">Change password</h3>
+      <p style="color:var(--muted); font-size:13.5px; margin:0 0 16px">
+        Enter your current password, then the new one twice. At least ${MIN_PASSWORD} characters, with a letter and a number.</p>
+      ${passwordField("cp-old", "Current password", "current-password")}
+      ${passwordField("cp-new", "New password", "new-password")}
+      ${passwordField("cp-new2", "Confirm new password", "new-password")}
+      <div class="err" id="cp-err"></div>
+      <div class="row">
+        <button class="btn primary" id="cp-save">Update password</button>
+        <a href="#" id="cp-forgot" style="font-size:13px">Forgot your current password?</a>
+      </div>
     </div>`;
+
+  $("main").querySelectorAll("[data-eye]").forEach(b => b.onclick = () => {
+    const el = $(b.dataset.eye);
+    el.type = el.type === "password" ? "text" : "password";
+  });
+  $("cp-save").onclick = changePassword;
+  $("cp-forgot").onclick = async (e) => {
+    e.preventDefault();
+    const ok = await confirmModal({
+      title: "Send a reset link?",
+      text: `We'll email a password-reset link to ${ME.email}. Open it, choose a new password, then sign in again.`,
+      okLabel: "Send link",
+    });
+    if(!ok) return;
+    try{
+      await sendPasswordResetEmail(auth, ME.email);
+      toast("Reset link sent — check your inbox (and spam).", "good");
+    }catch(err){ console.error(err); toast(authErrorText(err), "bad"); }
+  };
 
   $("pf-save").onclick = async () => {
     const name    = $("pf-name").value.trim();
