@@ -59,6 +59,19 @@ import { firebaseConfig, ADMIN_EMAILS, DEFAULT_LOCATION } from "./firebase-confi
 
 
 /* ============================================================
+   OPTIONAL ADD-ONS
+   Loaded separately so the core app keeps working even if an
+   add-on file is missing or switched off.
+   ============================================================ */
+let mapMod = null;                       // map.js (step 1: map view)
+const mapOn = () => !!(mapMod && mapMod.MAP_ENABLED);
+
+import("./map.js")
+  .then(m => { mapMod = m; if(ME && !modalOpen && !isTyping()) renderApp(); })
+  .catch(() => { /* no map.js → list view only, exactly as before */ });
+
+
+/* ============================================================
    FIREBASE INIT
    ============================================================ */
 const app  = initializeApp(firebaseConfig);
@@ -219,6 +232,9 @@ const state = {
   resTab: "active",       // pharmacy reservations tab
   salesTab: "bills",      // pharmacy sales tab
   orderTab: "active",     // admin orders tab
+  searchMode: "list",     // patient search: "list" | "map"   (map add-on)
+  mapView: null,          // { lat, lng, zoom } the patient last looked at
+  storeLocDraft: null,    // store location picked but not saved yet
 };
 
 
@@ -343,8 +359,13 @@ function refresh(){
   if(!ME) return;
   if(modalOpen){ pendingRefresh = true; return; }
   if(isTyping()){ pendingRefresh = true; return; }   // redraw when they leave the field
+  if(mapMod && mapMod.mapIsBusy()){ pendingRefresh = true; return; }   // a map popup is open
   renderApp();
   autoExpireHolds();
+}
+
+function runPendingRefresh(){
+  if(pendingRefresh && ME && !modalOpen && !isTyping()){ pendingRefresh = false; renderApp(); }
 }
 
 function isTyping(){
@@ -946,7 +967,7 @@ function navCount(v){
   return 0;
 }
 
-function go(view){ state.view = view; dirty.clear(); renderApp(); }
+function go(view){ state.view = view; state.storeLocDraft = null; dirty.clear(); renderApp(); }
 
 function renderApp(){
   if(!ME){ renderAuth(); return; }
@@ -961,6 +982,7 @@ function renderApp(){
 
   const unread = unreadCount();
   const keep = captureDirty();
+  if(mapMod) mapMod.destroyPharmacyMap();
 
   $("root").innerHTML = `
     <div class="topbar">
@@ -1257,8 +1279,84 @@ function searchResultsHtml(){
 function renderSearchResults(){
   const box = $("search-results");
   if(!box) return;
+  if(mapMod) mapMod.destroyPharmacyMap();
+  if(mapOn() && state.searchMode === "map"){ renderSearchMap(box); return; }
   box.innerHTML = searchResultsHtml();
   box.querySelectorAll("[data-reserve]").forEach(b => b.onclick = () => reserveMedicine(b.dataset.reserve));
+}
+
+/* ---------- Map view (add-on: map.js) ---------- */
+function hasMapLocation(ph){ return !!(ph && ph.locSet && num(ph.lat) !== null && num(ph.lng) !== null); }
+
+function mapPopupHtml(ph, rows){
+  const d = distanceTo(ph);
+  const listings = rows.map(r => {
+    const ss = stockState(r.inv.quantity);
+    const can = r.inv.quantity > 0;
+    return `<div class="map-item">
+      <div><b>${esc(r.med.name)}</b><br><small>${money(r.inv.price)} · <span class="pill ${ss.key}">${ss.label}${can ? ` · ${r.inv.quantity}` : ""}</span></small></div>
+      <button class="btn sm ${can ? "primary" : ""}" data-reserve="${esc(r.inv.id)}" ${can ? "" : "disabled"}>${can ? "Reserve" : "Out"}</button>
+    </div>`;
+  }).join("");
+
+  return `<div class="map-pop">
+    <div class="map-pop-name">${esc(ph.name)}</div>
+    <div class="map-pop-meta">📍 ${d === null ? "" : d.toFixed(1) + " km · "}${esc(ph.address)}<br>🕒 ${esc(ph.hours)}</div>
+    <div class="map-pop-links">${phoneLink(ph)} <a href="${esc(mapLink(ph))}" target="_blank" rel="noopener noreferrer">Directions ↗</a></div>
+    ${listings}
+  </div>`;
+}
+
+function renderSearchMap(box){
+  const q = state.searchQuery.trim().toLowerCase();
+  const groups = new Map();                          // pharmacy id -> { ph, rows }
+
+  if(q){
+    searchRows(q).forEach(r => {
+      if(!groups.has(r.ph.id)) groups.set(r.ph.id, { ph: r.ph, rows: [] });
+      groups.get(r.ph.id).rows.push(r);
+    });
+  } else {
+    cache.pharmacies.filter(p => p.status === "approved").forEach(p => groups.set(p.id, { ph: p, rows: [] }));
+  }
+
+  const all = [...groups.values()];
+  const located = all.filter(g => hasMapLocation(g.ph));
+  const missing = all.length - located.length;
+
+  const headline = q
+    ? (all.length
+        ? `${all.length} pharmac${all.length !== 1 ? "ies" : "y"} list${all.length === 1 ? "s" : ""} “${esc(state.searchQuery)}” — tap a pin to reserve.`
+        : `No pharmacy has “${esc(state.searchQuery)}” listed.`)
+    : `Showing all ${all.length} approved pharmac${all.length !== 1 ? "ies" : "y"}. Search a medicine to see who has it.`;
+
+  box.innerHTML = `
+    <p style="color:var(--muted); font-size:13px; margin:0 0 10px">${headline}</p>
+    <div id="ph-map" class="map" role="application" aria-label="Map of pharmacies"><div class="map-loading">Loading map…</div></div>
+    ${missing ? `<p style="color:var(--muted); font-size:12.5px; margin:10px 0 0">
+      ℹ️ ${missing} pharmac${missing !== 1 ? "ies haven't" : "y hasn't"} set a map location yet — switch to <b>List</b> to see ${missing !== 1 ? "them" : "it"}.</p>` : ""}`;
+
+  const here = patientLoc();
+  const el = $("ph-map");
+
+  mapMod.showPharmacyMap(el, {
+    me: { lat: here.lat, lng: here.lng, label: esc(state.loc ? "Your shared location" : BASE_LOC.label) },
+    points: located.map(g => ({
+      lat: g.ph.lat, lng: g.ph.lng, title: String(g.ph.name || ""),
+      dim: g.rows.length > 0 && g.rows.every(r => r.inv.quantity <= 0),
+      html: mapPopupHtml(g.ph, g.rows),
+    })),
+    view: state.mapView,
+    onView: (v) => { state.mapView = v; },
+    onPopup: (popupEl) => {
+      if(!popupEl) return;
+      popupEl.querySelectorAll("[data-reserve]").forEach(b => b.onclick = () => reserveMedicine(b.dataset.reserve));
+    },
+    onIdle: runPendingRefresh,
+  }).catch(e => {
+    console.error(e);
+    if(el.isConnected) el.innerHTML = `<div class="map-loading">⚠️ ${esc(e.message || "Couldn't load the map.")}<br>Switch to <b>List</b> view.</div>`;
+  });
 }
 
 let searchTimer = null;
@@ -1285,7 +1383,16 @@ function viewSearch(){
         <span style="margin-left:auto">🏷️ Active reservations: <b>${holds}/${MAX_ACTIVE_HOLDS}</b></span>
       </div>
     </div>
+    ${mapOn() ? `<div class="tabs" role="tablist" aria-label="Result view">
+      <button role="tab" aria-selected="${state.searchMode !== "map"}" data-smode="list" class="${state.searchMode !== "map" ? "active" : ""}">☰ List</button>
+      <button role="tab" aria-selected="${state.searchMode === "map"}" data-smode="map" class="${state.searchMode === "map" ? "active" : ""}">🗺️ Map</button>
+    </div>` : ""}
     <div id="search-results"></div>`;
+
+  $("main").querySelectorAll("[data-smode]").forEach(b => b.onclick = () => {
+    state.searchMode = b.dataset.smode;
+    viewSearch();
+  });
 
   renderSearchResults();
 
@@ -1301,13 +1408,14 @@ function viewSearch(){
     b.textContent = "Locating…";
     try{
       state.loc = await getBrowserLocation();
+      state.mapView = null;
       saveLoc(state.loc);
       toast("Location saved — sorting by real distance.", "good");
     }catch(e){ toast(e.message, "bad"); }
     viewSearch();
   };
   const lr = $("loc-reset");
-  if(lr) lr.onclick = () => { state.loc = null; saveLoc(null); viewSearch(); };
+  if(lr) lr.onclick = () => { state.loc = null; state.mapView = null; saveLoc(null); viewSearch(); };
 }
 
 
@@ -2244,6 +2352,52 @@ function viewPhSales(){
 /* ============================================================
    PHARMACY — store settings (allowed while pending too)
    ============================================================ */
+/* Store-location picker dialog (add-on: map.js) */
+function pickLocationOnMap(start, onDone){
+  let picked = { ...start };
+  let picker = null;
+
+  openModal(`
+    <h3>Pick your store on the map</h3>
+    <p class="sub">Click the exact spot, or drag the 🏥 pin. Zoom in for accuracy.</p>
+    <div id="pick-map" class="map map-sm"><div class="map-loading">Loading map…</div></div>
+    <p id="pick-coords" style="font-size:13px; color:var(--muted); margin:10px 0 14px">📍 ${picked.lat.toFixed(5)}, ${picked.lng.toFixed(5)}</p>
+    <div class="row" style="justify-content:space-between">
+      <button class="btn sm ghost" id="pick-gps" type="button">Jump to my current location</button>
+      <span>
+        <button class="btn ghost" data-close>Cancel</button>
+        <button class="btn primary" id="pick-ok">Use this location</button>
+      </span>
+    </div>`);
+
+  // make sure the Leaflet map is cleaned up however the dialog closes
+  const prevCloser = modalCloser;
+  modalCloser = () => { if(picker) picker.destroy(); prevCloser(); };
+
+  const el = $("pick-map");
+  mapMod.showLocationPicker(el, {
+    start,
+    onPick: (loc) => {
+      picked = loc;
+      const c = $("pick-coords");
+      if(c) c.textContent = `📍 ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}`;
+    },
+  }).then(pk => { picker = pk; })
+    .catch(e => { console.error(e); if(el.isConnected) el.innerHTML = `<div class="map-loading">⚠️ ${esc(e.message || "Couldn't load the map.")}</div>`; });
+
+  $("pick-gps").onclick = async () => {
+    const b = $("pick-gps");
+    b.disabled = true;
+    try{
+      const loc = await getBrowserLocation();
+      if(picker) picker.moveTo(loc.lat, loc.lng);
+    }catch(e){ toast(e.message, "bad"); }
+    b.disabled = false;
+  };
+
+  $("pick-ok").onclick = () => { const loc = picked; onDone(loc); closeModal(); };
+}
+
 function viewPhSettings(){
   const ph = myPharmacy();
   if(!ph || ph.status === "suspended"){ pendingGate(); return; }
@@ -2261,10 +2415,13 @@ function viewPhSettings(){
       <div class="fld" style="margin-bottom:16px">
         <span class="lab" style="font-size:13px; font-weight:600; display:block; margin-bottom:6px">Store location</span>
         <div class="row">
-          <span id="set-locmsg" style="font-size:13px; color:var(--muted)">${ph.locSet && num(ph.lat) !== null && num(ph.lng) !== null
+          <span id="set-locmsg" style="font-size:13px; color:var(--muted)">${state.storeLocDraft
+            ? `📍 ${state.storeLocDraft.lat.toFixed(5)}, ${state.storeLocDraft.lng.toFixed(5)} (click Save)`
+            : ph.locSet && num(ph.lat) !== null && num(ph.lng) !== null
             ? `📍 ${ph.lat.toFixed(5)}, ${ph.lng.toFixed(5)}`
             : "📍 Not set — patients see “distance unknown”."}</span>
           <button class="btn sm" id="set-loc" type="button">Use my current location</button>
+          ${mapOn() ? `<button class="btn sm" id="set-map" type="button">🗺️ Pick on map</button>` : ""}
         </div>
         <p style="font-size:12px; color:var(--faint); margin:6px 0 0">Do this while standing in the store for the most accurate distance.</p>
       </div>
@@ -2272,15 +2429,25 @@ function viewPhSettings(){
       <button class="btn primary" id="set-save">Save changes</button>
     </div>`;
 
-  let newLoc = null;
+  let newLoc = state.storeLocDraft;
+  const setNewLoc = (loc) => {
+    newLoc = state.storeLocDraft = loc;
+    const msg = $("set-locmsg");
+    if(msg) msg.textContent = `📍 ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)} (click Save)`;
+  };
 
   $("set-loc").onclick = async () => {
     const msg = $("set-locmsg");
     msg.textContent = "Getting location…";
-    try{
-      newLoc = await getBrowserLocation();
-      msg.textContent = `📍 ${newLoc.lat.toFixed(5)}, ${newLoc.lng.toFixed(5)} (click Save)`;
-    }catch(e){ msg.textContent = e.message; }
+    try{ setNewLoc(await getBrowserLocation()); }
+    catch(e){ msg.textContent = e.message; }
+  };
+
+  const mapBtn = $("set-map");
+  if(mapBtn) mapBtn.onclick = () => {
+    const start = newLoc
+      || (hasMapLocation(ph) ? { lat: ph.lat, lng: ph.lng } : { lat: BASE_LOC.lat, lng: BASE_LOC.lng });
+    pickLocationOnMap(start, setNewLoc);
   };
 
   $("set-save").onclick = async () => {
@@ -2296,6 +2463,7 @@ function viewPhSettings(){
     btn.disabled = true;
     try{
       await updateDoc(doc(db, "pharmacies", ph.id), data);
+      state.storeLocDraft = null;
       toast("Store details saved.", "good");
     }catch(e){
       console.error(e);
