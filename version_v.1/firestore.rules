@@ -23,6 +23,9 @@ rules_version = '2';
    • BILLS can't be edited or deleted.
    • NOTIFICATIONS only to yourself, from an admin, or between the
      two parties of a shared reservation.
+   • PRESCRIPTIONS (add-on): only the reservation's own patient can
+     attach one; only that patient, that pharmacy and the admin can
+     see it; the photo must be a JPEG under ~900 KB.
 
    HOW TO APPLY: Firebase console → Firestore Database → Rules →
    paste this WHOLE file → Publish.
@@ -300,6 +303,44 @@ service cloud.firestore {
                     && request.resource.data.total >= 0
                     && nearNow(request.resource.data.createdAt);
       allow update, delete: if false;
+    }
+
+    /* ---------- prescriptions (add-on, step 2) ----------
+       prescriptions/{reservationId} : small record (who + which pharmacy)
+       rxImages/{reservationId}      : the photo (a base64 JPEG, max ~900 KB)
+       Only the patient who owns the reservation may add / replace / remove.
+       Readable by that patient, that pharmacy, and the admin — nobody else. */
+    function rxForOwnReservation(resId) {
+      let r = get(path('reservations', resId)).data;
+      return r.patientId == uid()
+        && request.resource.data.patientId == uid()
+        && request.resource.data.pharmacyOwnerId == r.pharmacyOwnerId;
+    }
+
+    function rxReadable() {
+      return signedIn() && (resource.data.patientId == uid()
+        || resource.data.pharmacyOwnerId == uid()
+        || isAdmin());
+    }
+
+    match /prescriptions/{resId} {
+      allow read:   if rxReadable();
+      allow create, update: if active()
+                    && rxForOwnReservation(resId)
+                    && request.resource.data.keys().hasOnly(['patientId', 'pharmacyOwnerId', 'reservationId', 'bytes', 'createdAt'])
+                    && request.resource.data.reservationId == resId;
+      allow delete: if signedIn() && (resource.data.patientId == uid() || isAdmin());
+    }
+
+    match /rxImages/{resId} {
+      allow read:   if rxReadable();
+      allow create, update: if active()
+                    && rxForOwnReservation(resId)
+                    && request.resource.data.keys().hasOnly(['patientId', 'pharmacyOwnerId', 'image'])
+                    && request.resource.data.image is string
+                    && request.resource.data.image.size() <= 900000
+                    && request.resource.data.image[0:23] == 'data:image/jpeg;base64,';
+      allow delete: if signedIn() && (resource.data.patientId == uid() || isAdmin());
     }
 
     /* ---------- notifications ---------- */
