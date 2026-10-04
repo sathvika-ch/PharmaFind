@@ -1,0 +1,20 @@
+{
+  "name": "PharmaFind — Medicine & Pharmacy Finder",
+  "short_name": "PharmaFind",
+  "description": "Find which nearby pharmacy has your medicine in stock, reserve it, and pick it up.",
+  "id": "./index.html",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f4f6f4",
+  "theme_color": "#0f8a6f",
+  "lang": "en-IN",
+  "categories": ["medical", "health", "shopping"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

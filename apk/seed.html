@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PharmaFind — Demo data seeder</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    max-width:680px; margin:40px auto; padding:0 20px; color:#17211d; line-height:1.5; background:#f4f6f4}
+  h1{font-size:22px; margin-bottom:6px}
+  code{background:#e6ece8; padding:1px 6px; border-radius:5px; font-size:13px}
+  .card{background:#fff; border:1px solid #e0e5e1; border-radius:14px; padding:18px 20px; margin-top:16px}
+  label{display:block; font-size:13px; font-weight:600; margin:10px 0 5px}
+  input{width:100%; padding:10px 12px; border:1px solid #cdd5cf; border-radius:9px; font:inherit; box-sizing:border-box}
+  button{font:inherit; font-weight:600; padding:11px 18px; border-radius:9px; border:none;
+    background:#0f8a6f; color:#fff; cursor:pointer; margin-top:14px}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  #log{margin-top:16px; background:#0e1512; color:#c9e5db; padding:16px; border-radius:10px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; white-space:pre-wrap;
+    max-height:55vh; overflow:auto; min-height:60px}
+  .warn{background:#fbe0e0; border:1px solid #f0b4b4; color:#8a1c1c; padding:12px 14px; border-radius:10px; font-size:14px; display:none}
+  table{width:100%; border-collapse:collapse; font-size:14px}
+  td,th{padding:6px 8px; border-bottom:1px solid #e0e5e1; text-align:left}
+  small{color:#5f6d66}
+</style>
+</head>
+<body>
+  <h1>✚ PharmaFind — demo data seeder</h1>
+  <p>Creates demo accounts, the medicine catalog, two pharmacies and stock — matching the
+     current app (email + password login). Works with your normal <code>firestore.rules</code>;
+     no need to open them up. Safe to run more than once: anything that already exists is skipped.</p>
+
+  <div class="warn" id="filewarn">
+    ⚠️ You opened this file directly (<code>file://</code>). It must be opened through your local
+    server, the same way as the app — e.g. <code>http://localhost:8000/seed.html</code> or, with
+    VS Code Live Server, <code>http://127.0.0.1:5500/seed.html</code>.
+  </div>
+  <script>
+    if(location.protocol === "file:") document.getElementById("filewarn").style.display = "block";
+  </script>
+
+  <div class="card">
+    <b>Admin account</b>
+    <label for="adm-email">Admin email (from ADMIN_EMAILS in firebase-config.js)</label>
+    <input id="adm-email" disabled>
+    <label for="adm-pass">Admin password</label>
+    <input id="adm-pass" type="password" placeholder="At least 8 characters, a letter and a number">
+    <small>If the admin account doesn't exist yet it's created with this password.
+      If it already exists, type its real password.</small>
+    <br>
+    <button id="go" disabled>Loading…</button>
+  </div>
+
+  <div class="card">
+    <b>Demo accounts this creates</b>
+    <table>
+      <tr><th>Role</th><th>Email</th><th>Password</th></tr>
+      <tr><td>Pharmacy (approved)</td><td>medplus@pharmafind.test</td><td>medplus123</td></tr>
+      <tr><td>Pharmacy (pending)</td><td>apollo@pharmafind.test</td><td>apollo123</td></tr>
+      <tr><td>Patient</td><td>patient@pharmafind.test</td><td>patient123</td></tr>
+    </table>
+  </div>
+
+  <div id="log">Ready.</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+import {
+  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut,
+} from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import {
+  getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, query, where, writeBatch,
+} from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { firebaseConfig, ADMIN_EMAILS } from "./firebase-config.js";
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+const log = (m) => { logEl.textContent += "\n" + m; logEl.scrollTop = logEl.scrollHeight; };
+const now = () => Date.now();
+
+const ADMIN_EMAIL = String((ADMIN_EMAILS || [])[0] || "").trim().toLowerCase();
+$("adm-email").value = ADMIN_EMAIL || "(none set in firebase-config.js)";
+$("go").disabled = !ADMIN_EMAIL;
+$("go").textContent = "Seed demo data";
+
+const MEDS = [
+  ["Dolo 650",         "Paracetamol 650mg",      "Micro Labs"],
+  ["Azithromycin 500", "Azithromycin 500mg",     "Cipla"],
+  ["Cetirizine 10",    "Cetirizine 10mg",        "Dr. Reddy's"],
+  ["Amoxicillin 500",  "Amoxicillin 500mg",      "Sun Pharma"],
+  ["Pantoprazole 40",  "Pantoprazole 40mg",      "Alkem"],
+  ["ORS Powder",       "Oral Rehydration Salts", "FDC"],
+  ["Vitamin C 500",    "Ascorbic Acid 500mg",    "HealthVit"],
+  ["Metformin 500",    "Metformin 500mg",        "USV"],
+  ["Amlodipine 5",     "Amlodipine 5mg",         "Torrent"],
+  ["Ibuprofen 400",    "Ibuprofen 400mg",        "Abbott"],
+];
+
+const ACCOUNTS = {
+  medplus: { email: "medplus@pharmafind.test", pass: "medplus123", role: "pharmacy", name: "Ravi (MedPlus)",
+    store: { name: "MedPlus Pharmacy", address: "Ameerpet, Hyderabad", hours: "9:00 AM – 10:00 PM", lat: 17.4374, lng: 78.4487, phone: "+91 40 2374 1111" } },
+  apollo:  { email: "apollo@pharmafind.test",  pass: "apollo123",  role: "pharmacy", name: "Sana (Apollo)",
+    store: { name: "Apollo Pharmacy", address: "Banjara Hills, Hyderabad", hours: "8:00 AM – 11:00 PM", lat: 17.4126, lng: 78.4482, phone: "+91 40 2335 2222" } },
+  patient: { email: "patient@pharmafind.test", pass: "patient123", role: "patient",  name: "Sangeeth" },
+};
+
+const MEDPLUS_STOCK = [
+  ["Dolo 650", 120, 2.5], ["Azithromycin 500", 8, 14], ["Cetirizine 10", 0, 1.8],
+  ["Pantoprazole 40", 45, 6.5], ["ORS Powder", 60, 20], ["Vitamin C 500", 5, 4.2],
+];
+
+/* Sign in, or create the account if it doesn't exist yet. Returns the user. */
+async function signInOrCreate(email, pass){
+  try{
+    return (await signInWithEmailAndPassword(auth, email, pass)).user;
+  }catch(e){
+    if(e.code === "auth/invalid-credential" || e.code === "auth/user-not-found"){
+      try{
+        const u = (await createUserWithEmailAndPassword(auth, email, pass)).user;
+        log(`   ➕ created login ${email}`);
+        return u;
+      }catch(e2){
+        if(e2.code === "auth/email-already-in-use")
+          throw new Error(`${email} already exists with a DIFFERENT password. Use its real password (or delete it in Firebase → Authentication → Users).`);
+        throw e2;
+      }
+    }
+    throw e;
+  }
+}
+
+async function ensureUserDoc(user, role, name){
+  const ref = doc(db, "users", user.uid);
+  const snap = await getDoc(ref);
+  if(snap.exists()){ log(`   ⏭  profile exists (${snap.data().role})`); return; }
+  const profile = { role, name, email: user.email.toLowerCase(), phone: "", address: "", createdAt: now() };
+  if(role === "admin"){
+    // First admin: profile + one-time claim must be written together (rules require it)
+    if((await getDoc(doc(db, "meta", "adminClaim"))).exists())
+      throw new Error("The admin account was already claimed by a different login. Sign in with that admin account instead.");
+    const batch = writeBatch(db);
+    batch.set(ref, profile);
+    batch.set(doc(db, "meta", "adminClaim"), { uid: user.uid });
+    await batch.commit();
+  } else {
+    await setDoc(ref, profile);
+  }
+  log(`   ✅ profile saved as ${role}`);
+}
+
+async function ensurePharmacy(uid, store){
+  const q = await getDocs(query(collection(db, "pharmacies"), where("ownerUserId", "==", uid)));
+  if(!q.empty){ log(`   ⏭  store "${q.docs[0].data().name}" exists`); return q.docs[0].id; }
+  // one store per pharmacy account: document id = owner uid
+  await setDoc(doc(db, "pharmacies", uid), {
+    ownerUserId: uid, ...store, locSet: true, status: "pending", createdAt: now(),
+  });
+  log(`   ✅ store "${store.name}" registered (pending)`);
+  return uid;
+}
+
+async function seed(){
+  logEl.textContent = "Starting…";
+  const adminPass = $("adm-pass").value;
+  if(adminPass.length < 8 || !/[A-Za-z]/.test(adminPass) || !/\d/.test(adminPass))
+    throw new Error("Enter the admin password (at least 8 characters, with a letter and a number).");
+
+  const uids = {}, stores = {};
+
+  // 1) Pharmacy + patient accounts — each one writes its OWN data (allowed by the rules)
+  for(const [key, a] of Object.entries(ACCOUNTS)){
+    log(`\n👤 ${a.email}`);
+    const u = await signInOrCreate(a.email, a.pass);
+    uids[key] = u.uid;
+    await ensureUserDoc(u, a.role, a.name);
+    if(a.store) stores[key] = await ensurePharmacy(u.uid, a.store);
+    await signOut(auth);
+  }
+
+  // 2) Admin — catalog, approval, stock
+  log(`\n🛡️  admin ${ADMIN_EMAIL}`);
+  const admin = await signInOrCreate(ADMIN_EMAIL, adminPass);
+  await ensureUserDoc(admin, "admin", "System Admin");
+
+  const adminDoc = await getDoc(doc(db, "users", admin.uid));
+  if(adminDoc.data().role !== "admin")
+    throw new Error(`${ADMIN_EMAIL} already has a "${adminDoc.data().role}" profile. Delete that user doc in Firestore, then run again.`);
+
+  // catalog
+  const existing = await getDocs(collection(db, "medicines"));
+  const medId = {};
+  existing.docs.forEach(d => { medId[d.data().name] = d.id; });
+  let added = 0;
+  for(const [name, generic, mfr] of MEDS){
+    if(medId[name]) continue;
+    medId[name] = (await addDoc(collection(db, "medicines"), { name, generic, mfr })).id;
+    added++;
+  }
+  log(added ? `   ✅ catalog: added ${added} medicines` : `   ⏭  catalog already has these medicines`);
+
+  // approve MedPlus (Apollo stays pending so you can test Approvals)
+  const mpRef = doc(db, "pharmacies", stores.medplus);
+  if((await getDoc(mpRef)).data().status !== "approved"){
+    await updateDoc(mpRef, { status: "approved", approvedAt: now() });
+    log(`   ✅ MedPlus approved`);
+  } else log(`   ⏭  MedPlus already approved`);
+
+  // stock at MedPlus
+  const inv = await getDocs(query(collection(db, "inventory"), where("pharmacyId", "==", stores.medplus)));
+  const have = new Set(inv.docs.map(d => d.data().medicineId));
+  let stocked = 0;
+  for(const [name, quantity, price] of MEDPLUS_STOCK){
+    if(have.has(medId[name])) continue;
+    await addDoc(collection(db, "inventory"), {
+      pharmacyId: stores.medplus, ownerUserId: uids.medplus, medicineId: medId[name], quantity, price,
+    });
+    stocked++;
+  }
+  log(stocked ? `   ✅ MedPlus stock: ${stocked} medicines` : `   ⏭  MedPlus stock already there`);
+
+  await signOut(auth);
+
+  log("\n🎉 Done! Open the app and sign in with any account above.");
+  log(`   Admin → ${ADMIN_EMAIL} / (the password you typed)`);
+  log("   Try: patient searches 'dolo' → reserves → MedPlus marks it ready.");
+  log("   Apollo is left PENDING so you can approve it as admin.");
+}
+
+$("go").onclick = async (e) => {
+  e.target.disabled = true;
+  try{ await seed(); }
+  catch(err){
+    console.error(err);
+    const hint =
+      err.code === "permission-denied"        ? "  → Publish the latest firestore.rules, and check the admin email matches in BOTH files." :
+      err.code === "auth/operation-not-allowed" ? "  → Turn on Email/Password in Firebase → Authentication → Sign-in method." :
+      err.code === "auth/network-request-failed" ? "  → No internet connection." : "";
+    log("\n❌ " + (err.message || err.code) + (hint ? "\n" + hint : ""));
+    try{ await signOut(auth); }catch(_){}
+  }
+  e.target.disabled = false;
+};
+</script>
+</body>
+</html>
