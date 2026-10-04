@@ -301,3 +301,15 @@ tr:last-child td{border-bottom:none}
   max-height:60vh; overflow:auto; display:grid; place-items:center}
 .rx-full{display:block; max-width:100%; height:auto}
 .actions .btn.ghost + .btn{margin-left:6px}
+
+/* ---------- Search by prescription (add-on: rxscan.js) ---------- */
+.scan-chips{display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:13px; color:var(--muted); margin-top:10px}
+.chip{border:1px solid var(--border-strong); background:var(--surface-2); color:var(--ink); border-radius:100px;
+  padding:4px 12px; font-size:13px; font-weight:600; cursor:pointer}
+.chip:hover{border-color:var(--primary)}
+.chip.on{background:var(--primary-soft); color:var(--primary-dark); border-color:var(--primary)}
+.scan-progress{height:8px; background:var(--surface-2); border:1px solid var(--border); border-radius:100px; overflow:hidden}
+.scan-progress > div{height:100%; background:var(--primary); transition:width .2s ease}
+.scan-item{display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 0; border-top:1px dashed var(--border)}
+.scan-item .pill{margin-top:4px}
+.scan-item .btn{white-space:nowrap; flex-shrink:0}

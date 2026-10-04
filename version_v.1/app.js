@@ -78,6 +78,13 @@ import("./prescription.js")
   .then(m => { rxMod = m; if(ME){ setupRxListener(); if(!modalOpen && !isTyping()) renderApp(); } })
   .catch(() => { /* no prescription.js → no prescription buttons, exactly as before */ });
 
+let scanMod = null;                      // rxscan.js (search by prescription)
+const scanOn = () => !!(scanMod && scanMod.SCAN_ENABLED);
+
+import("./rxscan.js")
+  .then(m => { scanMod = m; if(ME && !modalOpen && !isTyping()) renderApp(); })
+  .catch(() => { /* no rxscan.js → no "Search by prescription" button, exactly as before */ });
+
 
 /* ============================================================
    FIREBASE INIT
@@ -245,6 +252,8 @@ const state = {
   mapView: null,          // { lat, lng, zoom } the patient last looked at
   storeLocDraft: null,    // store location picked but not saved yet
   rxDraft: null,          // prescription photo chosen while reserving (uploaded after payment)
+  scanMatches: [],        // medicines found by "Search by prescription": [{ id, name }]
+  scannedRx: null,        // the scanned photo (shrunk) — offered again when reserving
 };
 
 
@@ -574,6 +583,8 @@ async function logout(){
   state.searchQuery = "";
   state.billDraft = [];
   state.loc = loadSavedLoc();      // location belongs to the device, keep it
+  state.scanMatches = [];
+  state.scannedRx = null;
   state.authMode = "signin";
   closeModal();
   await signOut(auth);
@@ -1405,7 +1416,13 @@ function viewSearch(){
         <input class="input grow" id="search-in" type="search" aria-label="Search a medicine"
           placeholder="Search a medicine — name or salt…" value="${esc(state.searchQuery)}" autocomplete="off">
         <button class="btn primary" id="search-go">Search</button>
+        ${scanOn() ? `<button class="btn" id="scan-go" title="Upload a prescription photo and find its medicines">📄 Search by prescription</button>` : ""}
       </div>
+      ${scanOn() && state.scanMatches.length ? `<div class="scan-chips">
+        <span>📄 From your prescription:</span>
+        ${state.scanMatches.map(m => `<button class="chip ${state.searchQuery.trim().toLowerCase() === m.name.toLowerCase() ? "on" : ""}" data-scanpick="${esc(m.id)}">${esc(m.name)}</button>`).join("")}
+        <button class="btn sm ghost" id="scan-clear">Clear</button>
+      </div>` : ""}
       <div class="locbar">
         <span>${locText}</span>
         <button class="btn sm ghost" id="loc-btn">${state.loc ? "Refresh location" : "Use my location"}</button>
@@ -1423,6 +1440,15 @@ function viewSearch(){
     state.searchMode = b.dataset.smode;
     viewSearch();
   });
+
+  const scanBtn = $("scan-go");
+  if(scanBtn) scanBtn.onclick = openRxScan;
+  $("main").querySelectorAll("[data-scanpick]").forEach(b => b.onclick = () => {
+    const m = getMed(b.dataset.scanpick);
+    if(m){ state.searchQuery = m.name; dirty.delete("search-in"); viewSearch(); }
+  });
+  const scanClear = $("scan-clear");
+  if(scanClear) scanClear.onclick = () => { state.scanMatches = []; state.scannedRx = null; viewSearch(); };
 
   renderSearchResults();
 
@@ -1480,7 +1506,10 @@ function reserveMedicine(invId){
     </div>`);
 
   state.rxDraft = null;
-  if(rxOn()) wireRxPicker("res", (dataUrl) => { state.rxDraft = dataUrl; });
+  if(rxOn()){
+    wireRxPicker("res", (dataUrl) => { state.rxDraft = dataUrl; });
+    if(state.scannedRx) prefillRxPicker("res", state.scannedRx, (dataUrl) => { state.rxDraft = dataUrl; });
+  }
 
   const qtyEl = $("res-qty");
   qtyEl.oninput = () => {
@@ -1757,6 +1786,148 @@ function rxPickerHtml(prefix, label){
       <div id="${prefix}-rxprev"></div>
     </div>`;
 }
+
+/* Shows an already-chosen photo in a picker (used for the prescription the patient just scanned). */
+function prefillRxPicker(prefix, dataUrl, onChange){
+  const info = $(prefix + "-rxinfo"), prev = $(prefix + "-rxprev"), fileEl = $(prefix + "-rxfile");
+  if(!info || !prev || !rxMod.isSafeImage(dataUrl)) return;
+  onChange(dataUrl);
+  info.textContent = "✓ Using the prescription you scanned";
+  prev.innerHTML = `<img class="rx-thumb" alt="Prescription preview" src="${esc(dataUrl)}">
+    <button class="btn sm ghost" type="button" id="${prefix}-rxclear">Don't attach</button>`;
+  $(prefix + "-rxclear").onclick = () => {
+    onChange(null);
+    if(fileEl) fileEl.value = "";
+    prev.innerHTML = "";
+    info.textContent = "JPG or PNG. Only this pharmacy can see it.";
+  };
+}
+
+
+/* ============================================================
+   SEARCH BY PRESCRIPTION (add-on: rxscan.js)
+   Photo → text (in the browser) → matches in the catalog.
+   It only suggests; the patient confirms every medicine.
+   ============================================================ */
+function medAvailability(medId){
+  const rows = cache.inventory.filter(i => i.medicineId === medId && getPh(i.pharmacyId)?.status === "approved");
+  const inStock = rows.filter(i => i.quantity > 0);
+  if(!rows.length)    return { text: "No pharmacy lists it yet", cls: "neutral" };
+  if(!inStock.length) return { text: "Out of stock everywhere", cls: "out" };
+  const from = Math.min(...inStock.map(i => i.price));
+  return { text: `In stock at ${inStock.length} pharmac${inStock.length !== 1 ? "ies" : "y"} · from ${money(from)}`, cls: "ok" };
+}
+
+function openRxScan(){
+  let busy = false;
+
+  openModal(`
+    <h3>Search by prescription</h3>
+    <p class="sub">Upload a photo of your prescription. The app reads it on <b>your device</b> and finds those medicines in our catalog.</p>
+    <div class="row">
+      <label class="btn primary" for="scan-file">📷 Choose prescription photo</label>
+      <input id="scan-file" type="file" accept="image/*" style="position:absolute; opacity:0; width:1px; height:1px">
+    </div>
+    <p style="font-size:12.5px; color:var(--muted); margin:10px 0 0">
+      Works best with a clear, <b>printed</b> prescription, photographed straight from above in good light.
+      Handwriting is often not readable — you can always type the name instead.</p>
+    <div id="scan-out" style="margin-top:14px"></div>
+    <div class="row" style="justify-content:flex-end; margin-top:14px">
+      <button class="btn ghost" data-close>Close</button>
+    </div>`);
+
+  const fileEl = $("scan-file");
+  fileEl.onchange = async () => {
+    const file = fileEl.files && fileEl.files[0];
+    if(!file || busy) return;
+    const out = $("scan-out");
+    if(!/^image\//.test(file.type || "")){
+      out.innerHTML = `<div class="err">Please choose a photo (JPG or PNG). PDFs aren't supported yet.</div>`;
+      fileEl.value = "";
+      return;
+    }
+
+    busy = true;
+    out.innerHTML = `
+      <div class="scan-progress"><div id="scan-bar" style="width:3%"></div></div>
+      <p id="scan-label" style="font-size:13px; color:var(--muted); margin:8px 0 0">Starting… (the first time takes longer — it downloads the reader)</p>`;
+
+    try{
+      const text = await scanMod.readText(file, (pct, label) => {
+        const bar = $("scan-bar"), lab = $("scan-label");
+        if(bar) bar.style.width = pct + "%";
+        if(lab) lab.textContent = `${label} ${pct}%`;
+      });
+      if(!$("scan-out")) return;                              // dialog was closed meanwhile
+
+      const matches = scanMod.matchMedicines(text, cache.medicines);
+      state.scanMatches = matches.map(m => ({ id: m.id, name: m.name }));
+
+      // keep a small copy so it can be attached when reserving
+      state.scannedRx = null;
+      if(rxOn()){
+        try{ state.scannedRx = (await rxMod.compressImage(file)).dataUrl; }catch(_){ /* attaching is optional */ }
+      }
+      if(!$("scan-out")) return;
+      renderScanResults(matches, text);
+    }catch(e){
+      console.error(e);
+      const o = $("scan-out");
+      if(o) o.innerHTML = `<div class="err">${esc(e.message || "Couldn't read that photo.")}</div>`;
+    }finally{
+      busy = false;
+      if($("scan-file")) $("scan-file").value = "";
+    }
+  };
+}
+
+function renderScanResults(matches, text){
+  const out = $("scan-out");
+  if(!out) return;
+  const readable = String(text || "").trim();
+
+  const list = matches.length
+    ? `<p style="margin:0 0 8px"><b>${matches.length} medicine${matches.length !== 1 ? "s" : ""} found in our catalog</b></p>` +
+      matches.map(m => {
+        const a = medAvailability(m.id);
+        return `<div class="scan-item">
+          <div style="min-width:0">
+            <b>${esc(m.name)}</b> <span style="color:var(--muted)">· ${esc(m.generic)}</span><br>
+            <small style="color:var(--muted)">read as “${esc(m.found)}”${m.via === "salt" ? " (matched by salt name)" : ""}${m.strengthSeen === false ? " · ⚠️ strength not seen — check it" : ""}</small><br>
+            <span class="pill ${a.cls}">${esc(a.text)}</span>
+          </div>
+          <button class="btn sm primary" data-scanfind="${esc(m.id)}">Find pharmacies</button>
+        </div>`;
+      }).join("")
+    : `<div class="empty" style="padding:18px 8px">
+        <h3>${readable ? "No catalog medicine recognised" : "No text could be read"}</h3>
+        <p>${readable
+          ? "The photo was read, but nothing matched a medicine in our catalog. Close this and type the medicine name in the search box."
+          : "Try a sharper, closer photo in good light — or type the medicine name in the search box."}</p>
+      </div>`;
+
+  out.innerHTML = `
+    ${list}
+    <div class="hint" style="margin-top:12px">
+      ⚠️ <b>Check every medicine and strength against your paper prescription.</b> This is a reading aid and can be wrong
+      or miss items. If unsure, ask the pharmacist.
+    </div>
+    ${readable ? `<details style="margin-top:10px; font-size:12.5px; color:var(--muted)">
+      <summary style="cursor:pointer">Show the text the app read</summary>
+      <pre style="white-space:pre-wrap; margin:8px 0 0; font-family:inherit">${esc(readable.slice(0, 1500))}</pre>
+    </details>` : ""}`;
+
+  out.querySelectorAll("[data-scanfind]").forEach(b => b.onclick = () => {
+    const m = getMed(b.dataset.scanfind);
+    if(!m) return;
+    state.searchQuery = m.name;
+    dirty.delete("search-in");
+    closeModal();
+    state.view = "search";
+    renderApp();
+  });
+}
+
 
 function wireRxPicker(prefix, onChange){
   const fileEl = $(prefix + "-rxfile");
