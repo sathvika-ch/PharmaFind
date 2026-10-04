@@ -1853,14 +1853,21 @@ function openRxScan(){
       <p id="scan-label" style="font-size:13px; color:var(--muted); margin:8px 0 0">Starting… (the first time takes longer — it downloads the reader)</p>`;
 
     try{
-      const text = await scanMod.readText(file, (pct, label) => {
+      const onProgress = (pct, label) => {
         const bar = $("scan-bar"), lab = $("scan-label");
         if(bar) bar.style.width = pct + "%";
         if(lab) lab.textContent = `${label} ${pct}%`;
-      });
+      };
+      // scanPrescription = read → (if unclear) straighten + clean the photo and read again → match
+      let text, matches;
+      if(typeof scanMod.scanPrescription === "function"){
+        ({ text, matches } = await scanMod.scanPrescription(file, cache.medicines, onProgress));
+      } else {                                                 // older rxscan.js: single plain read
+        text = await scanMod.readText(file, onProgress);
+        matches = scanMod.matchMedicines(text, cache.medicines);
+      }
       if(!$("scan-out")) return;                              // dialog was closed meanwhile
 
-      const matches = scanMod.matchMedicines(text, cache.medicines);
       state.scanMatches = matches.map(m => ({ id: m.id, name: m.name }));
 
       // keep a small copy so it can be attached when reserving
@@ -1910,7 +1917,8 @@ function renderScanResults(matches, text){
     ${list}
     <div class="hint" style="margin-top:12px">
       ⚠️ <b>Check every medicine and strength against your paper prescription.</b> This is a reading aid and can be wrong
-      or miss items. If unsure, ask the pharmacist.
+      or miss items — handwriting especially. A medicine that isn't in our catalog can't be listed here; type its name
+      in the search box instead. If unsure, ask the pharmacist.
     </div>
     ${readable ? `<details style="margin-top:10px; font-size:12.5px; color:var(--muted)">
       <summary style="cursor:pointer">Show the text the app read</summary>
