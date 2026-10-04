@@ -35,8 +35,10 @@
      admins via "Make admin". Admins can Block / Remove accounts —
      removed accounts stay blocked so they can't re-register.
 
-   • PAYMENT is a MOCK screen (no real money). A real gateway needs
-     a backend (e.g. Cloud Functions + Razorpay).
+   • PAYMENT is a MOCK screen (no real money) — unless payments.js
+     has a Razorpay TEST key, then the Razorpay window is used
+     (still no real money). Live money needs a backend
+     (Cloud Functions: create the order + verify the signature).
 
    Every rule the app relies on is enforced in firestore.rules —
    the JavaScript checks here are only for a friendly UI.
@@ -84,6 +86,13 @@ const scanOn = () => !!(scanMod && scanMod.SCAN_ENABLED);
 import("./rxscan.js")
   .then(m => { scanMod = m; if(ME && !modalOpen && !isTyping()) renderApp(); })
   .catch(() => { /* no rxscan.js → no "Search by prescription" button, exactly as before */ });
+
+let payMod = null;                       // payments.js (Razorpay checkout — add-on, step 3)
+const payOn = () => !!(payMod && payMod.PAY_ENABLED && payMod.payConfigured());
+
+import("./payments.js")
+  .then(m => { payMod = m; })
+  .catch(() => { /* no payments.js (or no key in it) → the demo payment screen, exactly as before */ });
 
 
 /* ============================================================
@@ -1526,6 +1535,8 @@ function reserveMedicine(invId){
 }
 
 function openPayment(invId, med, ph, qty){
+  if(payOn()) return openOnlinePayment(invId, med, ph, qty);   // add-on: Razorpay window (payments.js)
+
   const inv = getInv(invId);
   const total = inv.price * qty;
 
@@ -1632,7 +1643,7 @@ function openPayment(invId, med, ph, qty){
   };
 }
 
-function showPaymentReceipt({ id, paymentRef, total, med, ph, qty, rx = "" }){
+function showPaymentReceipt({ id, paymentRef, total, med, ph, qty, rx = "", via = "" }){
   openModal(`
     <div style="text-align:center; margin-bottom:14px">
       <div style="font-size:38px">✅</div>
@@ -1643,6 +1654,7 @@ function showPaymentReceipt({ id, paymentRef, total, med, ph, qty, rx = "" }){
       <div class="kv"><span>Medicine</span><b>${esc(med.name)} × ${qty}</b></div>
       <div class="kv"><span>Pharmacy</span><b>${esc(ph.name)}</b></div>
       <div class="kv"><span>Paid</span><b style="color:var(--money)">${money(total)}</b></div>
+      ${via ? `<div class="kv"><span>Paid with</span><b>${esc(via)}</b></div>` : ""}
       ${rx === "ok" ? `<div class="kv"><span>Prescription</span><b>📎 Attached</b></div>` : ""}
     </div>
     ${rx === "fail" ? `<p style="font-size:13px; color:var(--out); margin:12px 0 0">
@@ -1651,6 +1663,198 @@ function showPaymentReceipt({ id, paymentRef, total, med, ph, qty, rx = "" }){
       The stock is now held for you. You'll get a notification when the pharmacy marks it <b>ready for pickup</b>.</p>
     <button class="btn primary" style="width:100%; margin-top:14px" id="rc-done">Done</button>`);
   $("rc-done").onclick = () => { closeModal(); go("reservations"); };
+}
+
+
+/* ------------------------------------------------------------
+   ONLINE PAYMENT (add-on, step 3 — needs payments.js + a key)
+   Order of events:
+     1. fresh check: still in stock? price unchanged? under the hold limit?
+     2. Razorpay window — patient pays by UPI / card / netbanking
+     3. the reservation + stock hold are saved in one transaction
+   If step 3 fails after a successful payment, the patient is told
+   clearly and given the payment ID (see showPaidNotReserved).
+   ------------------------------------------------------------ */
+function openOnlinePayment(invId, med, ph, qty){
+  const inv = getInv(invId);
+  let total = inv.price * qty;
+  const testMode = payMod.payMode() === "test";
+
+  openModal(`
+    <h3>Payment</h3>
+    <p class="sub">${qty} × ${esc(med.name)} at ${esc(ph.name)}</p>
+    ${testMode ? `<div class="hint" style="margin:0 0 16px">🧪 <b>Razorpay test mode</b> — no real money is taken.
+      Pay with UPI ID <b>success@razorpay</b>, or a card from
+      <a href="https://razorpay.com/docs/payments/payments/test-card-details/" target="_blank" rel="noopener">Razorpay's test cards</a>
+      (any future expiry, any CVV).</div>` : ""}
+
+    <div class="cart-total"><span>Amount</span><span class="t" id="pay-total">${money(total)}</span></div>
+    <p style="font-size:12.5px; color:var(--muted); margin:10px 0 0">
+      You pay in Razorpay's secure window — <b>UPI</b> (GPay, PhonePe, Paytm), <b>cards</b>, <b>netbanking</b> or <b>wallets</b>.
+      PharmaFind never sees your card number or UPI PIN.</p>
+    <div class="err" id="pay-err" style="margin-top:10px"></div>
+    <div class="row" style="justify-content:flex-end; margin-top:12px">
+      <button class="btn ghost" data-close>Cancel</button>
+      <button class="btn money" id="pay-go">Pay ${money(total)}</button>
+    </div>`);
+
+  const resRef = doc(collection(db, "reservations"));
+  let busy = false;
+
+  $("pay-go").onclick = async () => {
+    if(busy) return;
+    const err = $("pay-err"), btn = $("pay-go");
+    const reset = (msg) => {
+      busy = false;
+      if($("pay-err")) $("pay-err").textContent = msg || "";
+      if($("pay-go")){ $("pay-go").disabled = false; $("pay-go").textContent = "Pay " + money(total); }
+    };
+    busy = true;
+    err.textContent = "";
+    btn.disabled = true;
+
+    // 1) fresh check BEFORE any money moves
+    btn.textContent = "Checking stock…";
+    try{
+      const [s, h] = await Promise.all([getDoc(doc(db, "inventory", invId)), getDoc(doc(db, "holds", ME.uid))]);
+      if(!s.exists()) return reset("This item is no longer listed.");
+      const d = s.data();
+      if(d.quantity < qty) return reset(d.quantity > 0 ? `Only ${d.quantity} left now.` : "It just went out of stock.");
+      if((h.exists() ? (h.data().active || 0) : 0) >= MAX_ACTIVE_HOLDS) return reset(`You already have ${MAX_ACTIVE_HOLDS} active reservations.`);
+      const fresh = d.price * qty;
+      if(Math.abs(fresh - total) >= 0.005){
+        total = fresh;
+        if($("pay-total")) $("pay-total").textContent = money(total);
+        return reset(`The price changed — the amount is now ${money(total)}. Press Pay again to continue.`);
+      }
+    }catch(e){
+      console.error(e);
+      return reset("Couldn't check the stock. Check your connection and try again.");
+    }
+
+    // 2) the Razorpay window
+    btn.textContent = "Opening Razorpay…";
+    let payment;
+    try{
+      payment = await payMod.pay({
+        amount: total,
+        description: `${qty} × ${med.name} — ${ph.name}`,
+        customer: { name: ME.name, email: ME.email, phone: ME.phone },
+        notes: { reservation: resRef.id, medicine: med.name, qty: String(qty), pharmacy: ph.name, patient: ME.uid },
+      });
+    }catch(e){
+      console.error(e);
+      return reset(e && e.payCode ? e.message : "Payment didn't complete — you were not charged.");
+    }
+
+    // 3) save the reservation + hold the stock
+    if($("pay-go")) $("pay-go").textContent = "Confirming your reservation…";
+    const order = { invId, med, ph, qty, total, resRef, paymentRef: payment.paymentId, payMode: payment.mode };
+    try{
+      await reserveAfterPayment(order);
+    }catch(e){
+      console.error(e);
+      busy = false;
+      return showPaidNotReserved(order, e);
+    }
+    busy = false;
+    await finishPaidReservation(order);
+  };
+}
+
+/* Saves a reservation that was just paid for online. Same transaction as the demo
+   payment, plus: the price must still be exactly what the patient was charged. */
+async function reserveAfterPayment({ invId, ph, qty, total, resRef, paymentRef, payMode }){
+  await runTransaction(db, async (tx) => {
+    const invRef   = doc(db, "inventory", invId);
+    const holdsRef = doc(db, "holds", ME.uid);
+    const s = await tx.get(invRef);
+    const h = await tx.get(holdsRef);
+    if(!s.exists()) throw new Error("This item is no longer listed.");
+    const d = s.data();
+    if(d.quantity < qty) throw new Error(d.quantity > 0 ? `Only ${d.quantity} were left.` : "It went out of stock while you were paying.");
+    if(Math.abs(d.price * qty - total) >= 0.005) throw new Error("The price changed while you were paying.");
+    const activeNow = h.exists() ? (h.data().active || 0) : 0;
+    if(activeNow >= MAX_ACTIVE_HOLDS) throw new Error(`You already have ${MAX_ACTIVE_HOLDS} active reservations.`);
+
+    tx.update(invRef, { quantity: d.quantity - qty, lastHold: resRef.id });
+    tx.set(holdsRef, { active: activeNow + 1, lastRes: resRef.id });
+    tx.set(resRef, {
+      patientId: ME.uid, patientName: ME.name, patientPhone: ME.phone || "",
+      pharmacyId: d.pharmacyId, pharmacyOwnerId: ph.ownerUserId,
+      inventoryId: invId, medicineId: d.medicineId,
+      qty, unitPrice: d.price,
+      status: "pending",
+      paid: true, amountPaid: total, paymentRef,
+      payVia: "razorpay", payMode,
+      createdAt: now(), updatedAt: now(),
+    });
+  });
+}
+
+async function finishPaidReservation({ med, ph, qty, total, resRef, paymentRef, payMode }){
+  notify(ph.ownerUserId, `New paid reservation: ${qty} × ${med.name} — ${ME.name} (${money(total)})`, resRef.id);
+
+  let rx = "";                                   // "" | "ok" | "fail"
+  if(state.rxDraft && rxOn()){
+    try{ await saveRx(resRef.id, ph.ownerUserId, state.rxDraft); rx = "ok"; }
+    catch(e){ console.error("prescription upload failed", e); rx = "fail"; }
+    state.rxDraft = null;
+  }
+  showPaymentReceipt({ id: resRef.id, paymentRef, total, med, ph, qty, rx,
+                       via: "Razorpay" + (payMode === "test" ? " (test mode)" : "") });
+}
+
+/* The patient paid, but the reservation could not be saved (stock ran out in those
+   seconds, the connection dropped …). Never hide this: show the payment ID, say
+   what happens to the money, and let them try saving again. */
+function showPaidNotReserved(order, error){
+  const reason = (error && error.message && !error.code) ? error.message : "The reservation couldn't be saved.";
+  const test = order.payMode === "test";
+  openModal(`
+    <div style="text-align:center; margin-bottom:14px">
+      <div style="font-size:38px">⚠️</div>
+      <h3>Paid — but not reserved</h3>
+      <p class="sub">${esc(reason)}</p>
+    </div>
+    <div class="card" style="box-shadow:none; background:var(--surface-2)">
+      <div class="kv"><span>Payment ID</span><b style="user-select:all">${esc(order.paymentRef)}</b></div>
+      <div class="kv"><span>Amount</span><b>${money(order.total)}</b></div>
+      <div class="kv"><span>Medicine</span><b>${esc(order.med.name)} × ${order.qty}</b></div>
+    </div>
+    <p style="font-size:13px; color:var(--muted); margin:14px 0 0">
+      <b>No medicine is held for you.</b> ${test
+        ? "This was a test payment, so no real money was taken."
+        : "Keep the Payment ID above — the amount will be refunded to the same account."}
+      You can try saving the reservation again, or close this and pick another pharmacy.</p>
+    <div class="err" id="pnr-err" style="margin-top:10px"></div>
+    <div class="row" style="justify-content:flex-end; margin-top:12px">
+      <button class="btn ghost" data-close>Close</button>
+      <button class="btn primary" id="pnr-retry">Try again</button>
+    </div>`);
+
+  $("pnr-retry").onclick = async () => {
+    const btn = $("pnr-retry");
+    btn.disabled = true;
+    btn.textContent = "Trying…";
+    try{
+      await reserveAfterPayment(order);
+    }catch(e){
+      console.error(e);
+      if($("pnr-err")) $("pnr-err").textContent = (e.message && !e.code) ? e.message : "Still couldn't save it. Check your connection.";
+      if($("pnr-retry")){ $("pnr-retry").disabled = false; $("pnr-retry").textContent = "Try again"; }
+      return;
+    }
+    await finishPaidReservation(order);
+  };
+}
+
+/* Small line under the amount: the Razorpay payment ID, so the pharmacy / admin
+   can look the payment up in the Razorpay dashboard. Nothing for demo payments. */
+function payIdLine(r){
+  return r && r.payVia === "razorpay" && r.paymentRef
+    ? `<br><small style="color:var(--faint); user-select:all" title="Razorpay payment ID${r.payMode === "test" ? " (test mode)" : ""}">${esc(r.paymentRef)}</small>`
+    : "";
 }
 
 
@@ -2080,7 +2284,7 @@ function viewPatientReservations(){
           <td>${esc(ph ? ph.name : "—")}${ph ? `<br><small style="color:var(--muted)">${esc(ph.address)}</small>` : ""}
             ${ph && ph.phone ? `<br><small>${phoneLink(ph)}</small>` : ""}</td>
           <td>${r.qty}</td>
-          <td><span class="pill ok">${money(r.amountPaid)}</span></td>
+          <td><span class="pill ok">${money(r.amountPaid)}</span>${payIdLine(r)}</td>
           <td><span class="pill ${st.pill}">${st.label}</span>
             ${ACTIVE_RES.includes(r.status) ? `<br><small style="color:var(--muted)">⏳ ${timeLeft(holdExpiresAt(r) - now())}</small>` : ""}</td>
           <td style="color:var(--muted)">${timeAgo(r.createdAt)}</td>
@@ -2646,7 +2850,7 @@ function viewPhReservations(){
           <td><b>${esc(medName(r.medicineId))}</b><br><small style="color:var(--faint)">${shortId(r.id)}</small></td>
           <td>${esc(r.patientName || "Unknown")}${r.patientPhone ? `<br><small style="color:var(--muted)">${esc(r.patientPhone)}</small>` : ""}</td>
           <td>${r.qty}</td>
-          <td><span class="pill ok">${money(r.amountPaid)}</span></td>
+          <td><span class="pill ok">${money(r.amountPaid)}</span>${payIdLine(r)}</td>
           <td><span class="pill ${st.pill}">${st.label}</span></td>
           <td style="color:var(--muted)">${timeAgo(r.createdAt)}</td>
           <td class="actions">${actions}</td></tr>`;
@@ -3083,7 +3287,7 @@ function viewAdOrders(){
           <td>${r.qty} × ${esc(medName(r.medicineId))}</td>
           <td>${esc(r.patientName || "—")}</td>
           <td>${esc(getPh(r.pharmacyId)?.name || "—")}</td>
-          <td>${money(r.amountPaid)}</td>
+          <td>${money(r.amountPaid)}${payIdLine(r)}</td>
           <td><span class="pill ${st.pill}">${st.label}</span></td>
           <td style="color:var(--muted)">${timeAgo(r.createdAt)}</td>
           <td class="actions">${rxButton(r)}${ACTIVE_RES.includes(r.status) ? `<button class="btn sm danger" data-acancel="${r.id}">Cancel</button>` : ""}</td></tr>`;

@@ -24,7 +24,7 @@
 (function(){
   var SDK = "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
   var NEEDED   = ["app.js", "firebase-config.js", "styles.css"];
-  var OPTIONAL = ["map.js", "prescription.js", "rxscan.js"];
+  var OPTIONAL = ["map.js", "prescription.js", "rxscan.js", "payments.js"];
   var caught = [];
 
   function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); }
