@@ -37,7 +37,7 @@
 export const PAY_ENABLED = true;
 
 // ▼▼▼ paste your Razorpay TEST Key ID between the quotes ▼▼▼
-export const RAZORPAY_KEY_ID = "";
+export const RAZORPAY_KEY_ID = " rzp_test_TjqcMpp7lHcIX3";
 // ▲▲▲ e.g. "rzp_test_AbCdEfGh123456" ▲▲▲
 
 export const BUSINESS_NAME = "PharmaFind";
