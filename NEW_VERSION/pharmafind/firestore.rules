@@ -1,0 +1,294 @@
+rules_version = '2';
+
+/* ============================================================
+   PharmaFind — Firestore security rules
+   ------------------------------------------------------------
+   These are the REAL access control. The JavaScript checks in the
+   app are only UI — THESE rules decide what is allowed.
+
+   What they enforce:
+   • Users can only create their own profile, can't pick "admin"
+     unless their email is in adminEmails(), and can't change role.
+   • A pharmacy store doc id = its owner's uid (one store per user),
+     starts 'pending', and the owner can't self-approve.
+   • Inventory: owner edits price/stock. A PATIENT may only lower
+     stock as part of creating a matching reservation (stock hold).
+   • Reservations: the amount must equal price × qty of the stock
+     actually held in the same transaction; store must be approved.
+     Pharmacy/admin can only move pending → fulfilled / cancelled.
+   • Bills: every line must match an inventory doc that was
+     decremented by exactly that quantity IN THE SAME transaction,
+     line totals and the bill total are recomputed and checked.
+     Max 8 lines per bill. Bills can never be edited or deleted.
+   • Notifications: you can only notify yourself, the other party
+     of a reservation you're part of, or anyone if you're admin.
+
+   HOW TO APPLY:
+     Firebase console → Firestore Database → Rules → paste → Publish.
+   ============================================================ */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 🔽 Must match ADMIN_EMAILS in firebase-config.js (lowercase) 🔽
+    function adminEmails() {
+      return ['chavanaboinasathvika@gmail.com'];
+    }
+
+    /* ---------- helpers ---------- */
+    function signedIn() { return request.auth != null; }
+
+    function myEmail() {
+      return signedIn() && request.auth.token.email != null
+        ? request.auth.token.email.lower() : '';
+    }
+
+    function isAdminEmail() { return myEmail() in adminEmails(); }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    /* ================= users ================= */
+    function validNewUser(d) {
+      return d.keys().hasOnly(['role', 'name', 'email', 'phone', 'address', 'createdAt'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 80
+        && d.email == request.auth.token.email
+        && (d.role in ['patient', 'pharmacy'] || (d.role == 'admin' && isAdminEmail()));
+    }
+
+    function validProfile(d) {
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 80
+        && d.phone is string && d.phone.size() <= 30
+        && d.address is string && d.address.size() <= 200;
+    }
+
+    match /users/{uid} {
+      allow read:   if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn()
+                    && ((request.auth.uid == uid && validNewUser(request.resource.data))
+                        || isAdmin());
+      allow update: if signedIn()
+                    && ((request.auth.uid == uid
+                         && changed().hasOnly(['name', 'phone', 'address'])
+                         && validProfile(request.resource.data))
+                        || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    /* ================= medicines (public catalog) ================= */
+    match /medicines/{id} {
+      allow read:  if true;
+      allow write: if isAdmin();
+    }
+
+    /* ================= pharmacies ================= */
+    function validStore(d) {
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 100
+        && d.address is string && d.address.size() <= 200
+        && d.hours is string && d.hours.size() <= 60
+        && d.lat is number && d.lat >= -90 && d.lat <= 90
+        && d.lng is number && d.lng >= -180 && d.lng <= 180;
+    }
+
+    match /pharmacies/{phId} {
+      allow read:   if true;
+      allow create: if signedIn()
+                    && ((phId == request.auth.uid
+                         && request.resource.data.keys().hasOnly(
+                              ['ownerUserId', 'name', 'address', 'hours', 'lat', 'lng', 'status', 'createdAt'])
+                         && request.resource.data.ownerUserId == request.auth.uid
+                         && request.resource.data.status == 'pending'
+                         && validStore(request.resource.data))
+                        || isAdmin());
+      allow update: if signedIn()
+                    && ((resource.data.ownerUserId == request.auth.uid
+                         && changed().hasOnly(['name', 'address', 'hours', 'lat', 'lng'])
+                         && validStore(request.resource.data))
+                        || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    /* ================= inventory ================= */
+    function validStock(d) {
+      return d.quantity is int && d.quantity >= 0 && d.quantity <= 1000000
+        && d.price is number && d.price >= 0 && d.price <= 1000000;
+    }
+
+    // owner creates a listing: doc id must be "<pharmacyId>_<medicineId>"
+    function ownerCreate(invId) {
+      let d = request.resource.data;
+      let ph = get(/databases/$(database)/documents/pharmacies/$(d.pharmacyId)).data;
+      return d.keys().hasOnly(['pharmacyId', 'ownerUserId', 'medicineId', 'quantity', 'price'])
+        && d.ownerUserId == request.auth.uid
+        && invId == d.pharmacyId + '_' + d.medicineId
+        && ph.ownerUserId == request.auth.uid
+        && ph.status == 'approved'
+        && exists(/databases/$(database)/documents/medicines/$(d.medicineId))
+        && validStock(d);
+    }
+
+    // owner edits price / restocks / refunds a cancelled reservation
+    function ownerManualEdit() {
+      return resource.data.ownerUserId == request.auth.uid
+        && changed().hasOnly(['quantity', 'price'])
+        && validStock(request.resource.data);
+    }
+
+    // owner billing: stock drops by exactly lastBillQty and the bill exists after
+    function ownerBillEdit() {
+      let a = request.resource.data;
+      return resource.data.ownerUserId == request.auth.uid
+        && changed().hasOnly(['quantity', 'lastBillId', 'lastBillQty'])
+        && a.lastBillQty is int && a.lastBillQty > 0
+        && a.quantity == resource.data.quantity - a.lastBillQty
+        && a.quantity >= 0
+        && existsAfter(/databases/$(database)/documents/bills/$(a.lastBillId));
+    }
+
+    // patient stock hold: stock drops by exactly lastHoldQty and a NEW
+    // reservation with that id is created in the same transaction
+    function patientHold() {
+      let a = request.resource.data;
+      let holdId = a.get('lastHoldId', '');
+      return changed().hasOnly(['quantity', 'lastHoldId', 'lastHoldQty'])
+        && holdId is string && holdId != ''
+        && holdId != resource.data.get('lastHoldId', '')
+        && a.lastHoldQty is int && a.lastHoldQty > 0
+        && a.quantity == resource.data.quantity - a.lastHoldQty
+        && a.quantity >= 0
+        && !exists(/databases/$(database)/documents/reservations/$(holdId))
+        && existsAfter(/databases/$(database)/documents/reservations/$(holdId));
+    }
+
+    match /inventory/{invId} {
+      allow read:   if true;
+      allow create: if signedIn() && (ownerCreate(invId) || isAdmin());
+      allow update: if signedIn()
+                    && (ownerManualEdit() || ownerBillEdit() || patientHold() || isAdmin());
+      allow delete: if signedIn()
+                    && (resource.data.ownerUserId == request.auth.uid || isAdmin());
+    }
+
+    /* ================= reservations ================= */
+    function validReservation(resId, d) {
+      let inv = getAfter(/databases/$(database)/documents/inventory/$(d.inventoryId)).data;
+      let ph  = get(/databases/$(database)/documents/pharmacies/$(d.pharmacyId)).data;
+      return d.keys().hasOnly(['patientId', 'patientName', 'pharmacyId', 'pharmacyOwnerId',
+                               'inventoryId', 'medicineId', 'qty', 'status', 'paid',
+                               'amountPaid', 'paymentRef', 'paymentMethod', 'createdAt'])
+        && d.patientId == request.auth.uid
+        && d.patientName is string && d.patientName.size() <= 80
+        && d.status == 'pending'
+        && d.qty is int && d.qty > 0
+        && d.paid == true
+        && d.paymentRef is string && d.paymentRef.size() <= 40
+        && inv.lastHoldId == resId
+        && inv.lastHoldQty == d.qty
+        && inv.pharmacyId == d.pharmacyId
+        && inv.medicineId == d.medicineId
+        && inv.ownerUserId == d.pharmacyOwnerId
+        && d.amountPaid == inv.price * d.qty
+        && ph.status == 'approved'
+        && ph.ownerUserId == d.pharmacyOwnerId;
+    }
+
+    match /reservations/{resId} {
+      allow read:   if signedIn()
+                    && (resource.data.patientId == request.auth.uid
+                        || resource.data.pharmacyOwnerId == request.auth.uid
+                        || isAdmin());
+      allow create: if signedIn() && validReservation(resId, request.resource.data);
+      allow update: if signedIn()
+                    && (resource.data.pharmacyOwnerId == request.auth.uid || isAdmin())
+                    && resource.data.status == 'pending'
+                    && request.resource.data.status in ['fulfilled', 'cancelled']
+                    && changed().hasOnly(['status', 'updatedAt']);
+      allow delete: if isAdmin();
+    }
+
+    /* ================= bills (permanent record) ================= */
+    function lineAmt(d, i) { return d.items.size() > i ? d.items[i].lineTotal : 0; }
+
+    function billTotal(d) {
+      return lineAmt(d, 0) + lineAmt(d, 1) + lineAmt(d, 2) + lineAmt(d, 3)
+           + lineAmt(d, 4) + lineAmt(d, 5) + lineAmt(d, 6) + lineAmt(d, 7);
+    }
+
+    function billLineOK(billId, phId, it) {
+      let inv = getAfter(/databases/$(database)/documents/inventory/$(it.inventoryId)).data;
+      return it.quantity is int && it.quantity > 0
+        && it.unitPrice is number
+        && it.lineTotal == it.unitPrice * it.quantity
+        && inv.pharmacyId == phId
+        && inv.lastBillId == billId
+        && inv.lastBillQty == it.quantity
+        && inv.price == it.unitPrice;
+    }
+
+    function billLine(billId, d, i) {
+      return d.items.size() <= i || billLineOK(billId, d.pharmacyId, d.items[i]);
+    }
+
+    function validBill(billId, d) {
+      let ph = get(/databases/$(database)/documents/pharmacies/$(d.pharmacyId)).data;
+      return d.keys().hasOnly(['pharmacyId', 'ownerUserId', 'patientId', 'items', 'total', 'createdAt'])
+        && d.ownerUserId == request.auth.uid
+        && ph.ownerUserId == request.auth.uid
+        && ph.status == 'approved'
+        && d.items is list && d.items.size() >= 1 && d.items.size() <= 8
+        && d.total is number && d.total == billTotal(d)
+        && billLine(billId, d, 0) && billLine(billId, d, 1)
+        && billLine(billId, d, 2) && billLine(billId, d, 3)
+        && billLine(billId, d, 4) && billLine(billId, d, 5)
+        && billLine(billId, d, 6) && billLine(billId, d, 7);
+    }
+
+    match /bills/{billId} {
+      allow read:   if signedIn()
+                    && (resource.data.ownerUserId == request.auth.uid || isAdmin());
+      allow create: if signedIn() && validBill(billId, request.resource.data);
+      allow update, delete: if false;
+    }
+
+    /* ================= notifications ================= */
+    function notifPair(r, to) {
+      return (r.patientId == request.auth.uid && r.pharmacyOwnerId == to)
+          || (r.pharmacyOwnerId == request.auth.uid && r.patientId == to);
+    }
+
+    function relatedByReservation(d) {
+      let ref = d.get('refId', '');
+      return ref is string && ref != ''
+        && exists(/databases/$(database)/documents/reservations/$(ref))
+        && notifPair(get(/databases/$(database)/documents/reservations/$(ref)).data, d.userId);
+    }
+
+    function validNotif(d) {
+      return d.keys().hasOnly(['userId', 'text', 'read', 'createdAt', 'fromUid', 'refId'])
+        && d.userId is string
+        && d.text is string && d.text.size() > 0 && d.text.size() <= 300
+        && d.read == false
+        && d.fromUid == request.auth.uid
+        && (d.userId == request.auth.uid || relatedByReservation(d) || isAdmin());
+    }
+
+    match /notifications/{nId} {
+      allow read:   if signedIn()
+                    && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if signedIn() && validNotif(request.resource.data);
+      allow update: if signedIn()
+                    && resource.data.userId == request.auth.uid
+                    && changed().hasOnly(['read'])
+                    && request.resource.data.read == true;
+      allow delete: if signedIn()
+                    && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+  }
+}

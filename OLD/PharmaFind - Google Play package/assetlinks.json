@@ -1,0 +1,8 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "io.github.sathvika_ch.twa",
+        "sha256_cert_fingerprints": ["6A:2E:06:07:E0:B3:D7:B8:D3:B4:D0:72:D3:09:AA:71:4F:5D:9B:F7:55:FF:54:1C:5E:42:5F:21:FD:BD:71:77"]
+      }
+    }]

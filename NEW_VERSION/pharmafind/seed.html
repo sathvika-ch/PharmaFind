@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PharmaFind — Demo data loader</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    max-width:660px; margin:40px auto; padding:0 20px; color:#17211d; line-height:1.5}
+  h1{font-size:22px} h2{font-size:17px; margin:26px 0 8px}
+  code{background:#eef2ef; padding:1px 6px; border-radius:5px}
+  button{font:inherit; font-weight:600; padding:10px 16px; border-radius:9px; border:none;
+    background:#0f8a6f; color:#fff; cursor:pointer}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  select{font:inherit; padding:9px 10px; border-radius:9px; border:1px solid #cdd5cf; min-width:260px}
+  label{font-size:14px}
+  #log{margin-top:22px; background:#0e1512; color:#c9e5db; padding:16px; border-radius:10px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; white-space:pre-wrap;
+    max-height:50vh; overflow:auto; min-height:60px}
+  .note{background:#fbeed9; border:1px solid #e7cfa0; padding:12px 14px; border-radius:10px; font-size:14px}
+  .ok{background:#dcf5e4; border-color:#a8dcb9}
+  .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+</style>
+</head>
+<body>
+  <h1>✚ PharmaFind — demo data loader</h1>
+  <p>Fills the database with the sample medicine catalog and puts sample stock
+     into a pharmacy, so you can demo search, reservations and billing straight away.
+     It works with the normal security rules — no need to open them up.</p>
+
+  <div class="note" id="who">Checking who is signed in…</div>
+
+  <section id="tools" hidden>
+    <h2>1 · Sample medicine catalog</h2>
+    <p style="margin:0 0 10px; font-size:14px">Adds the 10 sample medicines (skips any already in the catalog).</p>
+    <button id="cat">Load sample catalog</button>
+
+    <h2>2 · Sample stock for a pharmacy</h2>
+    <p style="margin:0 0 10px; font-size:14px">First sign up a pharmacy account in the app (a second email), then pick it here.</p>
+    <div class="row">
+      <select id="ph"><option value="">Loading pharmacies…</option></select>
+      <button id="stock">Add sample stock</button>
+    </div>
+    <p style="margin:10px 0 0"><label><input type="checkbox" id="approve" checked> Also approve this pharmacy</label></p>
+  </section>
+
+  <div id="log">Ready.</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import { getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc }
+  from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { firebaseConfig } from "./firebase-config.js";
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+const log = (m) => { logEl.textContent += "\n" + m; logEl.scrollTop = logEl.scrollHeight; };
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const SAMPLE_MEDS = [
+  ["Dolo 650","Paracetamol 650mg","Micro Labs"],
+  ["Azithromycin 500","Azithromycin 500mg","Cipla"],
+  ["Cetirizine 10","Cetirizine 10mg","Dr. Reddy's"],
+  ["Amoxicillin 500","Amoxicillin 500mg","Sun Pharma"],
+  ["Pantoprazole 40","Pantoprazole 40mg","Alkem"],
+  ["ORS Powder","Oral Rehydration Salts","FDC"],
+  ["Vitamin C 500","Ascorbic Acid 500mg","HealthVit"],
+  ["Metformin 500","Metformin 500mg","USV"],
+  ["Amlodipine 5","Amlodipine 5mg","Torrent"],
+  ["Ibuprofen 400","Ibuprofen 400mg","Abbott"],
+];
+// [medicine name, quantity, price]
+const SAMPLE_STOCK = [
+  ["Dolo 650",120,2.5], ["Azithromycin 500",8,14], ["Cetirizine 10",0,1.8],
+  ["Pantoprazole 40",45,6.5], ["ORS Powder",60,20], ["Vitamin C 500",5,4.2],
+];
+
+onAuthStateChanged(auth, async (user) => {
+  const who = $("who");
+  if(!user){
+    who.innerHTML = `You're not signed in. Open <a href="index.html">PharmaFind</a>, sign in with your
+      <b>admin</b> email, then come back to this page (same browser, same web address).`;
+    return;
+  }
+  try{
+    const snap = await getDoc(doc(db, "users", user.uid));
+    if(!snap.exists() || snap.data().role !== "admin"){
+      who.innerHTML = `Signed in as <b>${esc(user.email)}</b>, but that account isn't an admin. Only an admin can load demo data.`;
+      return;
+    }
+    who.className = "note ok";
+    who.innerHTML = `Signed in as admin <b>${esc(user.email)}</b>.`;
+    $("tools").hidden = false;
+    await loadPharmacies();
+  }catch(e){
+    who.textContent = "Couldn't check your account: " + (e.code || e.message) + " — are the latest firestore.rules published?";
+  }
+});
+
+async function loadPharmacies(){
+  const sel = $("ph");
+  const snap = await getDocs(collection(db, "pharmacies"));
+  const list = snap.docs.map(d => ({ id:d.id, ...d.data() }));
+  sel.innerHTML = list.length
+    ? list.map(p => `<option value="${esc(p.id)}">${esc(p.name)} (${esc(p.status)})</option>`).join("")
+    : `<option value="">No pharmacies yet — sign one up in the app first</option>`;
+  $("stock").disabled = !list.length;
+}
+
+async function catalogByName(){
+  const snap = await getDocs(collection(db, "medicines"));
+  const map = {};
+  snap.docs.forEach(d => { map[(d.data().name || "").toLowerCase()] = d.id; });
+  return map;
+}
+
+$("cat").onclick = async (e) => {
+  e.target.disabled = true;
+  try{
+    const existing = await catalogByName();
+    let added = 0;
+    for(const [name, generic, mfr] of SAMPLE_MEDS){
+      if(existing[name.toLowerCase()]){ log(`⏭  ${name} already in catalog`); continue; }
+      await addDoc(collection(db, "medicines"), { name, generic, mfr });
+      added++; log(`✅ ${name}`);
+    }
+    log(`🎉 Catalog done — ${added} added.`);
+  }catch(err){ log("❌ " + (err.code || err.message)); }
+  e.target.disabled = false;
+};
+
+$("stock").onclick = async (e) => {
+  const phId = $("ph").value;
+  if(!phId) return;
+  e.target.disabled = true;
+  try{
+    const phSnap = await getDoc(doc(db, "pharmacies", phId));
+    if(!phSnap.exists()){ log("❌ That pharmacy no longer exists."); e.target.disabled = false; return; }
+    const ph = phSnap.data();
+    const meds = await catalogByName();
+    let added = 0;
+    for(const [name, quantity, price] of SAMPLE_STOCK){
+      const medicineId = meds[name.toLowerCase()];
+      if(!medicineId){ log(`⏭  ${name} isn't in the catalog — load the catalog first`); continue; }
+      const ref = doc(db, "inventory", `${phId}_${medicineId}`);
+      if((await getDoc(ref)).exists()){ log(`⏭  ${name} already stocked at ${ph.name}`); continue; }
+      await setDoc(ref, { pharmacyId:phId, ownerUserId:ph.ownerUserId, medicineId, quantity, price });
+      added++; log(`✅ ${name}: ${quantity} @ ₹${price}`);
+    }
+    if($("approve").checked && ph.status !== "approved"){
+      await updateDoc(doc(db, "pharmacies", phId), { status:"approved" });
+      log(`✅ ${ph.name} approved`);
+    }
+    log(`🎉 Stock done — ${added} item(s) added to ${ph.name}. Open index.html and search "Dolo".`);
+    await loadPharmacies();
+  }catch(err){ log("❌ " + (err.code || err.message)); }
+  e.target.disabled = false;
+};
+</script>
+</body>
+</html>
