@@ -14,13 +14,13 @@ export const firebaseConfig = {
 };
 
 /* ============================================================
-   ADMIN EMAILS
+   THE ADMIN  (PharmaFind has exactly ONE admin)
    ------------------------------------------------------------
-   Anyone who signs in with an email in this list becomes an ADMIN
-   automatically on first sign-in. Use lowercase.
+   This email is the only account that can manage PharmaFind.
+   It becomes admin automatically when it signs in. Use lowercase.
 
-   ⚠️ The SAME email(s) must also be in adminEmails() inside
-   firestore.rules — otherwise the rules refuse the admin account.
+   ⚠️ The SAME email must also be in adminEmails() inside
+   firestore.rules — the rules are what actually enforce it.
    ============================================================ */
 export const ADMIN_EMAILS = [
   "chavanaboinasathvika@gmail.com",

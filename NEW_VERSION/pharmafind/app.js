@@ -259,9 +259,12 @@ async function routeSignedIn(user){
 
   completingLink=false;
   const portal = hashPortal() || storedPortal();
+  const adminEmail = isAdminEmail(user.email);
   if(snap.exists()){
     const d=snap.data();
-    if(portal && d.role && portal!==d.role && ["patient","pharmacy","admin"].includes(d.role)){
+    if(d.role==="admin" && !adminEmail){ renderNotAdmin(user, true); return; }
+    if(adminEmail && d.role!=="admin"){ renderAdminUpgrade(user, d); return; }
+    if(d.role!=="admin" && portal && d.role && portal!==d.role && ["patient","pharmacy","admin"].includes(d.role)){
       renderPortalMismatch(user, d.role, portal); return;
     }
     if(d.role && PORTALS[d.role] && hashPortal()!==d.role){
@@ -276,7 +279,9 @@ async function routeSignedIn(user){
     state.view=null; state.searchQuery=""; state.billDraft=[];
     setupListeners();
     renderApp();
-  } else if(portal==="admin" && !isAdminEmail(user.email)){
+  } else if(adminEmail){
+    renderProfileSetup(user, "admin");          // the one admin email is always the admin
+  } else if(portal==="admin"){
     renderNotAdmin(user);
   } else {
     renderProfileSetup(user, portal);
@@ -298,12 +303,39 @@ function renderPortalMismatch(user, role, portal){
   $("pm-out").onclick=logout;
 }
 
-function renderNotAdmin(user){
+function renderAdminUpgrade(user, d){
   $("root").innerHTML=`<div class="auth-wrap"><div class="auth-card" style="text-align:center">
     ${BRAND}
     <div style="font-size:38px; margin:16px 0 6px">🛡️</div>
-    <h3 class="auth-title">Not an admin account</h3>
-    <p class="auth-sub"><b>${esc(user.email)}</b> isn't on the admin list, so it can't open the admin portal.</p>
+    <h3 class="auth-title">This is the PharmaFind admin email</h3>
+    <p class="auth-sub"><b>${esc(user.email)}</b> was registered earlier as a <b>${esc(ROLE_NAME[d.role]||d.role)}</b>.
+      PharmaFind has one admin, and it's this email. Switch this account to admin to manage PharmaFind.</p>
+    <div class="err" id="au-up-err"></div>
+    <button class="btn primary big" id="au-up" style="width:100%">Switch to admin</button>
+    <button class="btn ghost" id="au-up-out" style="width:100%; margin-top:8px">Sign out</button>
+  </div></div>`;
+  $("au-up-out").onclick=logout;
+  $("au-up").onclick=async ()=>{
+    const b=$("au-up"); b.disabled=true; b.textContent="Switching…";
+    try{
+      await updateDoc(doc(db,"users",user.uid), { role:"admin" });
+      setPortal("admin"); renderLoading("Loading…"); await routeSignedIn(user);
+      toast("You're now the PharmaFind admin.", "good");
+    }catch(e){
+      console.error(e);
+      $("au-up-err").textContent = e.code==="permission-denied"
+        ? "The database refused — publish the latest firestore.rules first." : "Couldn't switch. Try again.";
+      b.disabled=false; b.textContent="Switch to admin";
+    }
+  };
+}
+
+function renderNotAdmin(user, wasAdmin=false){
+  $("root").innerHTML=`<div class="auth-wrap"><div class="auth-card" style="text-align:center">
+    ${BRAND}
+    <div style="font-size:38px; margin:16px 0 6px">🛡️</div>
+    <h3 class="auth-title">${wasAdmin ? "Admin access removed" : "Not an admin account"}</h3>
+    <p class="auth-sub">PharmaFind has one admin. <b>${esc(user.email)}</b> ${wasAdmin ? "is no longer that admin" : "isn't the admin"}, so it can't open the admin portal.</p>
     <button class="btn primary big" id="na-out" style="width:100%">Sign out & try another account</button>
     <button class="btn ghost" id="na-pat" style="width:100%; margin-top:8px">Continue as a patient instead</button>
   </div></div>`;
@@ -840,6 +872,24 @@ function openNotifications(){
 
 /* ---------- Shared reservation status helpers ---------- */
 const RES_PILL = { pending:"pending", fulfilled:"approved", cancelled:"suspended" };
+const RES_LABEL = { pending:"Waiting for pickup", fulfilled:"Completed", cancelled:"Cancelled" };
+const resLabel = (st) => RES_LABEL[st] || st;
+
+/* tabs: Pending / Completed / Cancelled / All */
+function resTabs(list, key){
+  const counts={ pending:0, fulfilled:0, cancelled:0 };
+  list.forEach(r=>{ if(counts[r.status]!=null) counts[r.status]++; });
+  const sel = state[key] || (counts.pending ? "pending" : "all");   // only a user's click is remembered
+  const tabs=[["pending","⏳ Waiting"],["fulfilled","✅ Completed"],["cancelled","✖ Cancelled"],["all","All"]];
+  const html=`<div class="tabs">${tabs.map(([k,l])=>`
+    <button class="tab ${sel===k?'active':''}" data-restab="${k}">${l}
+      <span class="tab-n">${k==="all"?list.length:counts[k]}</span></button>`).join("")}</div>`;
+  const shown = sel==="all" ? list : list.filter(r=>r.status===sel);
+  return { html, shown };
+}
+function bindResTabs(key, rerender){
+  $("main").querySelectorAll("[data-restab]").forEach(b=>b.onclick=()=>{ state[key]=b.dataset.restab; rerender(); });
+}
 
 /* Cancel a pending reservation and put its stock back (pharmacy or admin). */
 async function cancelReservation(resId){
@@ -862,14 +912,14 @@ async function cancelReservation(resId){
 
 async function fulfillReservation(r){
   await updateDoc(doc(db,"reservations",r.id), { status:"fulfilled", updatedAt:now() });
-  notify(r.patientId, `Your reservation for ${getMed(r.medicineId)?.name||'a medicine'} is ready for pickup.`, r.id);
+  notify(r.patientId, `Your order of ${r.qty} × ${getMed(r.medicineId)?.name||'a medicine'} is completed. Thank you!`, r.id);
 }
 
 function bindReservationActions(){
   $("main").querySelectorAll("[data-fulfill]").forEach(b=>b.onclick=async ()=>{
     const r=cache.reservations.find(x=>x.id===b.dataset.fulfill); if(!r) return;
     b.disabled=true;
-    try{ await fulfillReservation(r); toast("Marked fulfilled — patient notified.", "good"); }
+    try{ await fulfillReservation(r); toast("Marked as completed — patient notified.", "good"); }
     catch(e){ console.error(e); toast("Could not update reservation.", "bad"); b.disabled=false; }
   });
   $("main").querySelectorAll("[data-cancel]").forEach(b=>b.onclick=async ()=>{
@@ -889,15 +939,17 @@ function reservationRows(list, { showPharmacy=false, showActions=false }={}){
     const m=getMed(r.medicineId), ph=getPh(r.pharmacyId);
     const paid = r.paid ? `<span class="pill ok">${money(r.amountPaid)}</span>` : `<span class="pill neutral">—</span>`;
     const actions = showActions && r.status==="pending" ? `
-      <button class="btn sm primary" data-fulfill="${r.id}">Mark fulfilled</button>
-      <button class="btn sm danger" data-cancel="${r.id}">Cancel</button>` : "—";
+      <button class="btn sm primary" data-fulfill="${r.id}">✓ Mark as completed</button>
+      <button class="btn sm danger" data-cancel="${r.id}">Cancel</button>`
+      : r.status==="fulfilled" ? `<span class="done-note">✓ Handed over${r.updatedAt?` · ${timeAgo(r.updatedAt)}`:""}</span>`
+      : r.status==="cancelled" ? `<span class="done-note muted">Stock returned${r.updatedAt?` · ${timeAgo(r.updatedAt)}`:""}</span>` : "—";
     return `<tr>
       <td><b>${esc(m?m.name:'—')}</b></td>
       ${showPharmacy?`<td>${esc(ph?ph.name:'—')}</td>`:""}
       <td>${esc(r.patientName||'Unknown')}</td>
       <td>${r.qty}</td>
       <td>${paid}</td>
-      <td><span class="pill ${RES_PILL[r.status]||'neutral'}">${esc(r.status)}</span></td>
+      <td><span class="pill ${RES_PILL[r.status]||'neutral'}">${esc(resLabel(r.status))}</span></td>
       <td style="color:var(--muted)">${timeAgo(r.createdAt)}</td>
       ${showActions?`<td style="text-align:right; white-space:nowrap">${actions}</td>`:""}</tr>`;
   }).join("");
@@ -1137,7 +1189,7 @@ function viewPatientReservations(){
           <td>${esc(ph?ph.name:'—')}</td>
           <td>${r.qty}</td>
           <td>${paid}${r.status==="cancelled"&&r.paid?' <span class="pill neutral">refund due</span>':''}</td>
-          <td><span class="pill ${RES_PILL[r.status]||'neutral'}">${esc(r.status)}</span></td>
+          <td><span class="pill ${RES_PILL[r.status]||'neutral'}">${esc(r.status==="pending"?"Ready — collect at store":resLabel(r.status))}</span></td>
           <td style="color:var(--muted)">${timeAgo(r.createdAt)}</td></tr>`;
       }).join("")}</tbody>
     </table></div>`;
@@ -1798,16 +1850,21 @@ function showBillReceipt(bill, ph){
 function viewPhReservations(){
   if(pendingGate(true)) return;
   const ph=myPharmacy();
-  const res=cache.reservations.filter(r=>r.pharmacyId===ph.id).sort((a,b)=>b.createdAt-a.createdAt);
-  const body = !loaded.has("reservations") ? loadingBlock() : res.length ? `
-    <div class="table-wrap"><table>
-      <thead><tr><th>Medicine</th><th>Patient</th><th>Qty</th><th>Paid</th><th>Status</th><th>When</th><th></th></tr></thead>
-      <tbody>${reservationRows(res, { showActions:true })}</tbody>
-    </table></div>` :
+  const all=cache.reservations.filter(r=>r.pharmacyId===ph.id).sort((a,b)=>b.createdAt-a.createdAt);
+  const { html:tabs, shown } = resTabs(all, "phResTab");
+  const body = !loaded.has("reservations") ? loadingBlock() : !all.length ?
     `<div class="empty"><div class="big">🏷️</div><h3>No reservations</h3>
-      <p>When a patient reserves one of your medicines, it appears here.</p></div>`;
+      <p>When a patient reserves one of your medicines, it appears here.</p></div>` :
+    shown.length ? `
+    <div class="table-wrap"><table>
+      <thead><tr><th>Medicine</th><th>Patient</th><th>Qty</th><th>Paid</th><th>Status</th><th>Ordered</th><th style="text-align:right">Action</th></tr></thead>
+      <tbody>${reservationRows(shown, { showActions:true })}</tbody>
+    </table></div>` : `<div class="empty"><div class="big">✨</div><h3>Nothing here</h3><p>No reservations in this list.</p></div>`;
   $("main").innerHTML=`<div class="page-head"><h2>Reservations</h2>
-    <p>Paid online. The stock is already set aside — hand it over and mark fulfilled, or cancel to return it to stock.</p></div>${body}`;
+    <p>Patients have already paid and the stock is set aside. When the patient collects the medicine, press
+    <b>✓ Mark as completed</b>. If they don't come, press <b>Cancel</b> to put the stock back.</p></div>
+    ${all.length?tabs:""}${body}`;
+  bindResTabs("phResTab", viewPhReservations);
   bindReservationActions();
 }
 
@@ -2010,18 +2067,19 @@ function viewAdPharmacies(){
 }
 
 function viewAdReservations(){
-  const res=[...cache.reservations].sort((a,b)=>{
-    const pa=a.status==="pending"?0:1, pb=b.status==="pending"?0:1;
-    return pa-pb || b.createdAt-a.createdAt;
-  });
-  const body = !loaded.has("reservations") ? loadingBlock() : res.length ? `
+  const all=[...cache.reservations].sort((a,b)=>b.createdAt-a.createdAt);
+  const { html:tabs, shown } = resTabs(all, "adResTab");
+  const body = !loaded.has("reservations") ? loadingBlock() : !all.length ?
+    `<div class="empty"><div class="big">🏷️</div><h3>No reservations yet</h3></div>` :
+    shown.length ? `
     <div class="table-wrap"><table>
-      <thead><tr><th>Medicine</th><th>Pharmacy</th><th>Patient</th><th>Qty</th><th>Paid</th><th>Status</th><th>When</th><th></th></tr></thead>
-      <tbody>${reservationRows(res, { showPharmacy:true, showActions:true })}</tbody>
-    </table></div>` :
-    `<div class="empty"><div class="big">🏷️</div><h3>No reservations yet</h3></div>`;
+      <thead><tr><th>Medicine</th><th>Pharmacy</th><th>Patient</th><th>Qty</th><th>Paid</th><th>Status</th><th>Ordered</th><th style="text-align:right">Action</th></tr></thead>
+      <tbody>${reservationRows(shown, { showPharmacy:true, showActions:true })}</tbody>
+    </table></div>` : `<div class="empty"><div class="big">✨</div><h3>Nothing here</h3><p>No reservations in this list.</p></div>`;
   $("main").innerHTML=`<div class="page-head"><h2>All reservations</h2>
-    <p>Step in if a store can't handle one — cancelling returns the stock.</p></div>${body}`;
+    <p>Step in if a store can't handle one — completing or cancelling works the same as for the store.</p></div>
+    ${all.length?tabs:""}${body}`;
+  bindResTabs("adResTab", viewAdReservations);
   bindReservationActions();
 }
 
@@ -2134,8 +2192,8 @@ function viewAdAccounts(){
     <div class="hint" style="margin-top:16px">
       <b>How accounts are created:</b> a person taps “Continue with Google” (or uses an
       email link) and then picks patient or pharmacy.
-      To make someone an <b>admin</b>, add their email to <code>ADMIN_EMAILS</code>
-      in firebase-config.js and to <code>adminEmails()</code> in firestore.rules.
+      <b>PharmaFind has one admin</b> — <code>${esc(adminEmails[0]||"")}</code>. Nobody else can be made
+      admin from the app; the database rules block it.
       Deleting removes their profile, store, stock and notifications and cancels
       their open reservations. Bills stay as a permanent record.
     </div>`;
