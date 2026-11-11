@@ -828,30 +828,90 @@ function renderApp(){
 
   const unread=unreadCount(user.uid);
 
+  const pendingBadge = (user.role==="admin" ? cache.pharmacies.filter(x=>x.status==="pending").length : 0)
+    + cache.reservations.filter(r=>r.status==="pending" && (user.role!=="patient")).length;
+  const viewTitle = (nav.find(n=>n.v===state.view)||{}).label || "";
+
   $("root").innerHTML=`
     <div class="topbar">
-      <div class="brand"><span class="mark"><span>✚</span></span> PharmaFind</div>
+      <button class="icon-btn menu-btn" id="btn-menu" aria-label="Open menu">${MENU_ICON}${pendingBadge?`<span class="badge-dot dot-only"></span>`:""}</button>
+      <div class="brand"><span class="mark"><span>✚</span></span><span class="brand-text">PharmaFind</span></div>
       <span class="role-chip">${roleLabel}</span>
+      <span class="top-title">${esc(viewTitle)}</span>
       <div class="spacer"></div>
-      <button class="icon-btn" id="btn-notif" title="Notifications">🔔${unread?`<span class="badge-dot">${unread}</span>`:''}</button>
+      <button class="icon-btn" id="btn-notif" title="Notifications" aria-label="Notifications">🔔${unread?`<span class="badge-dot">${unread}</span>`:''}</button>
       <div class="who"><b>${esc(user.name)}</b><span class="sub">${esc(user.email)}</span></div>
-      <button class="icon-btn" id="btn-logout" title="Sign out">⏻</button>
+      <button class="icon-btn desk-only" id="btn-logout" title="Sign out" aria-label="Sign out">⏻</button>
     </div>
+    <div class="drawer-bg" id="drawer-bg"></div>
     <div class="app">
-      <aside class="side">
+      <aside class="side" id="side" aria-label="Menu">
+        <div class="drawer-head">
+          <div class="row" style="justify-content:space-between">
+            <div class="brand"><span class="mark"><span>✚</span></span> PharmaFind</div>
+            <button class="icon-btn" id="btn-menu-close" aria-label="Close menu">✕</button>
+          </div>
+          <div class="drawer-user">
+            <div class="avatar">${esc((user.name||"?").trim().charAt(0).toUpperCase()||"?")}</div>
+            <div style="min-width:0"><b>${esc(user.name)}</b><small>${esc(user.email)}</small>
+              <span class="role-chip" style="margin-top:6px; display:inline-block">${roleLabel}</span></div>
+          </div>
+        </div>
         <div class="navlabel">Menu</div>
         ${navItems}
+        <div class="drawer-foot">
+          <button class="navitem" id="btn-logout-m"><span class="ic">⏻</span> Sign out</button>
+        </div>
       </aside>
       <main class="main" id="main"></main>
     </div>`;
 
   $("root").querySelectorAll("[data-view]").forEach(b=>{
-    b.onclick=()=>{ state.view=b.dataset.view; renderApp(); };
+    b.onclick=()=>{ state.view=b.dataset.view; closeDrawer(); renderApp(); window.scrollTo(0,0); };
   });
   $("btn-logout").onclick=logout;
+  $("btn-logout-m").onclick=()=>{ closeDrawer(); logout(); };
   $("btn-notif").onclick=openNotifications;
+  $("btn-menu").onclick=openDrawer;
+  $("btn-menu-close").onclick=()=>closeDrawer();
+  $("drawer-bg").onclick=()=>closeDrawer();
 
   renderView();
+}
+
+/* ---------- Phone: slide-in menu (hamburger) ---------- */
+const MENU_ICON = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>`;
+function openDrawer(){
+  if(document.body.classList.contains("drawer-open")) return;
+  document.body.classList.add("drawer-open");
+  try{ window.history.pushState({ pfDrawer:true }, document.title, window.location.href); }catch(_){}
+}
+function closeDrawer(fromBack=false){
+  if(!document.body.classList.contains("drawer-open")) return;
+  document.body.classList.remove("drawer-open");
+  if(!fromBack && window.history.state && window.history.state.pfDrawer){ try{ window.history.back(); }catch(_){} }
+}
+window.addEventListener("popstate", ()=>{ if(document.body.classList.contains("drawer-open")) closeDrawer(true); });
+document.addEventListener("keydown", e=>{ if(e.key==="Escape"){ closeDrawer(); if(modalOpen) closeModal(); } });
+
+/* ---------- Phone: tables become cards (labels come from the header row) ---------- */
+function labelTables(){
+  document.querySelectorAll("table:not([data-keep])").forEach(t=>{
+    const heads=[...t.querySelectorAll("thead th")].map(th=>th.textContent.trim());
+    if(!heads.length) return;
+    t.classList.add("stack");
+    t.querySelectorAll("tbody tr").forEach(tr=>{
+      [...tr.children].forEach((td,i)=>{ if(!td.hasAttribute("data-label")) td.setAttribute("data-label", heads[i]||""); });
+    });
+  });
+}
+let labelQueued=false;
+const nextFrame = (fn)=> (typeof requestAnimationFrame==="function" ? requestAnimationFrame(fn) : setTimeout(fn,16));
+if(typeof MutationObserver==="function"){
+  new MutationObserver(()=>{
+    if(labelQueued) return; labelQueued=true;
+    nextFrame(()=>{ labelQueued=false; labelTables(); });
+  }).observe(document.body, { childList:true, subtree:true });
 }
 
 function renderView(){
@@ -1582,10 +1642,10 @@ function showImportPreview(fileName, { plan, guessed, truncated }){
         detail=`<b>${it.qty}</b> @ ${money(it.price)}`;
       } else detail=`<span style="color:var(--out)">${esc(it.note)}</span>`;
       return `<tr>
-        <td style="color:var(--faint)">${it.line}</td>
         <td><b>${esc(it.displayName||it.name||"—")}</b>${it.status==="newmed"?`<br><small style="color:var(--muted)">${esc(it.generic||"")}</small>`:""}</td>
         <td><span class="pill ${STATUS[it.status].pill}">${STATUS[it.status].label}</span></td>
-        <td>${detail}</td></tr>`;
+        <td>${detail}</td>
+        <td style="color:var(--faint)">${it.line}</td></tr>`;
     }).join("");
     $("imp-table").innerHTML=rows;
     const ok=plan.filter(x=>["new","update","newmed"].includes(x.status)).length;
@@ -1610,7 +1670,7 @@ function showImportPreview(fileName, { plan, guessed, truncated }){
         <option value="add">Add the file's quantity to current stock (restock)</option>
       </select></label>`:""}
     <div class="table-wrap imp-wrap"><table>
-      <thead><tr><th>Row</th><th>Medicine</th><th>Action</th><th>Change</th></tr></thead>
+      <thead><tr><th>Medicine</th><th>Action</th><th>Change</th><th>File row</th></tr></thead>
       <tbody id="imp-table"></tbody>
     </table></div>
     <div class="err" id="imp-err2" style="margin-top:10px"></div>
@@ -1776,7 +1836,12 @@ function viewPhBilling(){
           Create bill · ${money(total)}</button>
         ${state.billDraft.length?`<button class="btn ghost" id="bill-clear" style="width:100%; margin-top:8px">Clear</button>`:''}
       </div>
-    </div>`;
+    </div>
+    ${state.billDraft.length?`
+    <div class="m-billbar">
+      <div><small>${state.billDraft.reduce((s,l)=>s+l.qty,0)} item(s) · ${state.billDraft.length} medicine(s)</small><b>${money(total)}</b></div>
+      <button class="btn money" id="bill-create-m">Create bill</button>
+    </div>`:""}`;
 
   const addBtn=$("bill-add");
   if(addBtn) addBtn.onclick=()=>{
@@ -1806,6 +1871,7 @@ function viewPhBilling(){
   });
   const clr=$("bill-clear"); if(clr) clr.onclick=()=>{ state.billDraft=[]; viewPhBilling(); };
   const create=$("bill-create"); if(create) create.onclick=createBill;
+  const createM=$("bill-create-m"); if(createM) createM.onclick=()=>{ createM.disabled=true; createBill(); };
 }
 
 async function createBill(){
@@ -1863,7 +1929,7 @@ function showBillReceipt(bill, ph){
       <p class="sub">${esc(ph.name)} · ${new Date(bill.createdAt).toLocaleString()}</p>
     </div>
     <div class="table-wrap" style="box-shadow:none">
-      <table><thead><tr><th>Item</th><th style="text-align:center">Qty</th>
+      <table data-keep><thead><tr><th>Item</th><th style="text-align:center">Qty</th>
       <th style="text-align:right">Price</th><th style="text-align:right">Total</th></tr></thead>
       <tbody>${rows}</tbody></table>
     </div>
@@ -1950,7 +2016,7 @@ function viewPhSettings(){
         <label class="fld grow"><span class="lab">Longitude</span><input class="input" id="set-lng" type="number" step="any" value="${lng}"></label>
       </div>
       <p style="margin:-4px 0 14px"><button class="btn sm" id="set-loc" type="button">📍 Use my current location</button>
-        <span style="font-size:12.5px; color:var(--muted); margin-left:6px">Stand inside the store when you tap this.</span></p>
+        <span class="loc-help">Stand inside the store when you tap this.</span></p>
       <div class="err" id="set-err"></div>
       <button class="btn primary" id="set-save">Save changes</button>
     </div>`;

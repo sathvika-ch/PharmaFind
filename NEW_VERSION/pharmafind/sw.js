@@ -3,7 +3,7 @@
    - App files: network first, cached copy if offline.
    - Firebase / Google / CDN traffic is never cached (live data stays live). */
 
-const CACHE = "pharmafind-v1";
+const CACHE = "pharmafind-v2";
 const SHELL = [
   "./", "./index.html", "./app.js", "./styles.css", "./firebase-config.js",
   "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png",
