@@ -269,6 +269,24 @@
     background:var(--primary-soft); color:var(--primary-dark)}
   @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .portal-chip{color:var(--primary)} }
 
+  /* ---------- Stock import ---------- */
+  .dropzone{display:flex; flex-direction:column; align-items:center; gap:4px; padding:26px 16px; cursor:pointer;
+    border:2px dashed var(--border-strong); border-radius:14px; background:var(--surface-2); text-align:center;
+    color:var(--muted); font-size:14px; transition:border-color .15s, background .15s}
+  .dropzone:hover,.dropzone.over{border-color:var(--primary); background:var(--primary-soft)}
+  .dropzone.busy{opacity:.6; pointer-events:none}
+  .dropzone input{display:none}
+  .dropzone .dz-ic{font-size:30px}
+  .dropzone b{color:var(--ink); font-size:15px}
+  .dropzone small{color:var(--faint)}
+  .imp-summary{display:flex; flex-wrap:wrap; gap:6px}
+  .imp-wrap{max-height:42vh; overflow:auto; margin-top:12px}
+  .imp-wrap th{position:sticky; top:0; background:var(--surface); z-index:1}
+  .imp-progress{margin-top:12px}
+  .imp-progress .bar{height:8px; border-radius:100px; background:var(--surface-2); overflow:hidden}
+  .imp-progress .bar span{display:block; height:100%; width:0; background:var(--primary); transition:width .2s}
+  .imp-progress small{color:var(--muted); display:block; margin-top:6px}
+
   /* ---------- Toast ---------- */
   #toasts{position:fixed; bottom:22px; left:50%; transform:translateX(-50%); z-index:100;
     display:flex; flex-direction:column; gap:8px; align-items:center}
@@ -280,6 +298,7 @@
   /* ---------- Modal ---------- */
   .modal-bg{position:fixed; inset:0; background:rgba(10,16,13,.5); z-index:90; display:grid; place-items:center; padding:20px; animation:up .2s ease}
   .modal{background:var(--surface); border-radius:18px; padding:24px; width:100%; max-width:440px; box-shadow:var(--shadow); border:1px solid var(--border)}
+  .modal.wide{max-width:720px}
   .modal h3{font-size:19px; margin-bottom:4px}
   .modal p.sub{color:var(--muted); font-size:14px; margin:0 0 18px}
 

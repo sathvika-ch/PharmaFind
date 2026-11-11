@@ -153,9 +153,9 @@ function toast(msg, kind=""){
   setTimeout(()=>{ el.style.opacity="0"; el.style.transition="opacity .3s"; setTimeout(()=>el.remove(),300); }, 3200);
 }
 let modalCloser=null;
-function openModal(html){
+function openModal(html, opts={}){
   const root=$("modal-root");
-  root.innerHTML=`<div class="modal-bg" data-modalbg><div class="modal">${html}</div></div>`;
+  root.innerHTML=`<div class="modal-bg" data-modalbg><div class="modal ${opts.wide?'wide':''}">${html}</div></div>`;
   modalOpen=true;
   modalCloser=()=>{ root.innerHTML=""; modalCloser=null; modalOpen=false;
     if(pendingRefresh){ pendingRefresh=false; refresh(); } };
@@ -1269,9 +1269,13 @@ function viewPhInventory(){
   $("main").innerHTML=`
     <div class="page-head row" style="justify-content:space-between; align-items:flex-end">
       <div><h2>Inventory</h2><p>Stock patients see when they search. Reserved units are already deducted.</p></div>
-      <button class="btn primary" id="add-inv">＋ Add medicine</button>
+      <div class="row">
+        <button class="btn" id="import-inv">⬆ Import CSV / Excel</button>
+        <button class="btn primary" id="add-inv">＋ Add medicine</button>
+      </div>
     </div>${body}`;
   $("add-inv").onclick=()=>editInventory(null);
+  $("import-inv").onclick=openStockImport;
   $("main").querySelectorAll("[data-edit-inv]").forEach(b=> b.onclick=()=>editInventory(b.dataset.editInv));
   $("main").querySelectorAll("[data-del-inv]").forEach(b=> b.onclick=async ()=>{
     const i=cache.inventory.find(x=>x.id===b.dataset.delInv); if(!i) return;
@@ -1283,6 +1287,321 @@ function viewPhInventory(){
       catch(e){ console.error(e); toast("Could not remove item.", "bad"); }
     }
   });
+}
+
+/* ============================================================
+   BULK STOCK IMPORT  (CSV / Excel)
+   ============================================================ */
+const SHEETJS_URL = "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs";
+const IMPORT_MAX_ROWS = 2000;
+const COL_ALIASES = {
+  name:     ["name","medicine","medicine name","medicinename","item","item name","product","product name","brand","drug","drug name"],
+  quantity: ["quantity","qty","stock","units","count","available","quantity available","qty available"],
+  price:    ["price","mrp","rate","unit price","price per unit","selling price","sp","cost","amount"],
+  generic:  ["generic","salt","composition","generic name","salt name","molecule"],
+  mfr:      ["manufacturer","mfr","company","brand owner","maker","mfg","manufactured by"],
+};
+
+const nameKey = (n) => String(n||"").toLowerCase().normalize("NFKD")
+  .replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"").slice(0,100);
+
+function parseCSV(text){
+  text=String(text).replace(/^﻿/,"");
+  const firstLine=text.split(/\r?\n/).find(l=>l.trim())||"";
+  const counts={",":0,";":0,"\t":0};
+  let q=false; for(const ch of firstLine){ if(ch==='"') q=!q; else if(!q && ch in counts) counts[ch]++; }
+  const delim=Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][1]>0 ? Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0] : ",";
+  const rows=[]; let row=[], cell="", inQ=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(inQ){
+      if(c==='"'){ if(text[i+1]==='"'){ cell+='"'; i++; } else inQ=false; }
+      else cell+=c;
+    } else if(c==='"') inQ=true;
+    else if(c===delim){ row.push(cell); cell=""; }
+    else if(c==="\n"||c==="\r"){ if(c==="\r"&&text[i+1]==="\n") i++; row.push(cell); rows.push(row); row=[]; cell=""; }
+    else cell+=c;
+  }
+  if(cell!==""||row.length){ row.push(cell); rows.push(row); }
+  return rows.filter(r=>r.some(c=>String(c).trim()!==""));
+}
+
+function readFileAs(file, kind){
+  if(kind==="text" && typeof file.text==="function") return file.text();
+  if(kind==="buffer" && typeof file.arrayBuffer==="function") return file.arrayBuffer();
+  return new Promise((resolve, reject)=>{
+    const fr=new FileReader();
+    fr.onload=()=>resolve(fr.result);
+    fr.onerror=()=>reject(new Error("Couldn't read that file."));
+    kind==="text" ? fr.readAsText(file) : fr.readAsArrayBuffer(file);
+  });
+}
+
+async function readSheetRows(file){
+  const ext=(file.name.split(".").pop()||"").toLowerCase();
+  if(ext==="csv"||ext==="txt"||file.type==="text/csv") return parseCSV(await readFileAs(file, "text"));
+  if(ext==="xlsx"||ext==="xls"||ext==="ods"){
+    let XLSX;
+    try{ XLSX=await import(SHEETJS_URL); }
+    catch(e){ throw new Error("Couldn't load the Excel reader (check your internet). You can also save the sheet as CSV and import that."); }
+    const wb=XLSX.read(new Uint8Array(await readFileAs(file, "buffer")), { type:"array" });
+    const ws=wb.Sheets[wb.SheetNames[0]];
+    if(!ws) throw new Error("The workbook has no sheets.");
+    return XLSX.utils.sheet_to_json(ws, { header:1, raw:true, defval:"" })
+      .filter(r=>r.some(c=>String(c).trim()!==""));
+  }
+  throw new Error("Please choose a .csv, .xlsx or .xls file.");
+}
+
+function mapColumns(rows){
+  const norm=(h)=>String(h||"").toLowerCase().replace(/[_\-.()₹]/g," ").replace(/\s+/g," ").trim();
+  for(let r=0; r<Math.min(rows.length,5); r++){
+    const hdr=rows[r].map(norm); const map={};
+    for(const [key,aliases] of Object.entries(COL_ALIASES)){
+      const idx=hdr.findIndex(h=>aliases.includes(h));
+      if(idx>=0) map[key]=idx;
+    }
+    if(map.name!=null && (map.quantity!=null || map.price!=null)) return { map, start:r+1, guessed:false };
+  }
+  // no header row: assume name, quantity, price, generic, manufacturer
+  return { map:{ name:0, quantity:1, price:2, generic:3, mfr:4 }, start:0, guessed:true };
+}
+
+function toNumber(v){
+  if(typeof v==="number") return v;
+  const t=String(v??"").replace(/[₹,\s]/g,"").replace(/^rs\.?/i,"");
+  if(t==="") return NaN;
+  return Number(t);
+}
+
+function buildImportPlan(rows, ph){
+  const { map, start, guessed } = mapColumns(rows);
+  const catalogByKey={};
+  cache.medicines.forEach(m=>{ catalogByKey[nameKey(m.name)]=m; });
+  const invByMed={};
+  cache.inventory.filter(i=>i.pharmacyId===ph.id).forEach(i=>{ invByMed[i.medicineId]=i; });
+  const seen=new Set(); const plan=[];
+  const body=rows.slice(start, start+IMPORT_MAX_ROWS);
+  body.forEach((r, idx)=>{
+    const line=start+idx+1;
+    const name=String(r[map.name]??"").trim();
+    const qRaw=map.quantity!=null ? r[map.quantity] : "";
+    const pRaw=map.price!=null ? r[map.price] : "";
+    const generic=map.generic!=null ? String(r[map.generic]??"").trim() : "";
+    const mfr=map.mfr!=null ? String(r[map.mfr]??"").trim() : "";
+    const item={ line, name, generic, mfr, status:"", note:"" };
+    if(!name){ item.status="error"; item.note="Missing medicine name"; plan.push(item); return; }
+    const key=nameKey(name);
+    if(!key){ item.status="error"; item.note="Name has no letters or numbers"; plan.push(item); return; }
+    if(seen.has(key)){ item.status="skip"; item.note="Duplicate row — first one is used"; plan.push(item); return; }
+    seen.add(key);
+    const qty=toNumber(qRaw), price=toNumber(pRaw);
+    const qtyOk = qRaw==="" || (Number.isFinite(qty) && qty>=0 && Number.isInteger(qty));
+    const priceOk = pRaw==="" || (Number.isFinite(price) && price>=0);
+    if(!qtyOk){ item.status="error"; item.note=`Quantity "${qRaw}" must be a whole number`; plan.push(item); return; }
+    if(!priceOk){ item.status="error"; item.note=`Price "${pRaw}" isn't a number`; plan.push(item); return; }
+    item.qty = qRaw==="" ? null : qty;
+    item.price = pRaw==="" ? null : round2(price);
+    const med=catalogByKey[key];
+    item.key=key;
+    if(med){
+      item.medicineId=med.id; item.displayName=med.name;
+      const inv=invByMed[med.id];
+      if(inv){ item.status="update"; item.inv=inv; }
+      else {
+        if(item.qty==null||item.price==null){ item.status="error"; item.note="New items need both quantity and price"; plan.push(item); return; }
+        item.status="new";
+      }
+    } else {
+      if(item.qty==null||item.price==null){ item.status="error"; item.note="New items need both quantity and price"; plan.push(item); return; }
+      item.status="newmed"; item.displayName=name; item.medicineId=key;
+    }
+    plan.push(item);
+  });
+  return { plan, guessed, truncated: rows.length-start > IMPORT_MAX_ROWS };
+}
+
+function downloadTemplate(){
+  const csv = "name,quantity,price,generic,manufacturer\n"
+    + "Dolo 650,120,2.50,Paracetamol 650mg,Micro Labs\n"
+    + "Azithromycin 500,30,14.00,Azithromycin 500mg,Cipla\n"
+    + "Cetirizine 10,200,1.80,Cetirizine 10mg,Dr. Reddy's\n";
+  const blob=new Blob(["﻿"+csv], { type:"text/csv;charset=utf-8" });
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob); a.download="pharmafind-stock-template.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+}
+
+function openStockImport(){
+  openModal(`
+    <h3>Import stock from a file</h3>
+    <p class="sub">Upload a CSV or Excel sheet with your medicines. You'll see a preview before anything is saved.</p>
+
+    <label class="dropzone" id="imp-drop">
+      <input type="file" id="imp-file" accept=".csv,.xlsx,.xls,.ods,text/csv">
+      <span class="dz-ic">📄</span>
+      <b>Choose a file</b> <span>or drag it here</span>
+      <small>.csv · .xlsx · .xls</small>
+    </label>
+    <div class="err" id="imp-err" style="margin-top:10px"></div>
+
+    <div class="hint" style="margin-top:12px">
+      <b>Columns needed:</b> <code>name</code>, <code>quantity</code>, <code>price</code>
+      &nbsp;·&nbsp; optional: <code>generic</code>, <code>manufacturer</code><br>
+      Headings like <i>Medicine, Qty, Stock, MRP, Rate, Salt, Company</i> also work.
+      Medicines not in the catalog yet are added automatically.
+    </div>
+    <div class="row" style="justify-content:space-between; margin-top:16px">
+      <button class="btn ghost" id="imp-tpl">⬇ Download template</button>
+      <button class="btn" onclick="closeModal()">Cancel</button>
+    </div>`, { wide:true });
+
+  $("imp-tpl").onclick=downloadTemplate;
+  const input=$("imp-file"), drop=$("imp-drop");
+  input.onchange=()=>{ if(input.files && input.files[0]) handleImportFile(input.files[0]); };
+  drop.addEventListener("dragover", e=>{ e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", ()=>drop.classList.remove("over"));
+  drop.addEventListener("drop", e=>{ e.preventDefault(); drop.classList.remove("over");
+    const f=e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if(f) handleImportFile(f); });
+}
+
+async function handleImportFile(file){
+  const err=$("imp-err"); if(err) err.textContent="";
+  if(file.size > 5*1024*1024){ if(err) err.textContent="That file is over 5 MB. Split it into smaller files."; return; }
+  const drop=$("imp-drop"); if(drop) drop.classList.add("busy");
+  try{
+    const rows=await readSheetRows(file);
+    if(!rows.length) throw new Error("The file is empty.");
+    const ph=myPharmacy();
+    const result=buildImportPlan(rows, ph);
+    if(!result.plan.length) throw new Error("No medicine rows found under the header.");
+    showImportPreview(file.name, result);
+  }catch(e){
+    console.error(e);
+    if($("imp-err")) $("imp-err").textContent=e.message||"Couldn't read that file.";
+    if($("imp-drop")) $("imp-drop").classList.remove("busy");
+  }
+}
+
+function showImportPreview(fileName, { plan, guessed, truncated }){
+  const n=(st)=>plan.filter(x=>x.status===st).length;
+  const STATUS={
+    new:{ pill:"approved", label:"New stock" },
+    update:{ pill:"pending", label:"Update" },
+    newmed:{ pill:"neutral", label:"New medicine" },
+    skip:{ pill:"neutral", label:"Skipped" },
+    error:{ pill:"suspended", label:"Error" },
+  };
+  const draw=()=>{
+    const mode=$("imp-mode")?.value||"set";
+    const rows=plan.map(it=>{
+      let detail="";
+      if(it.status==="update"){
+        const newQty = it.qty==null ? it.inv.quantity : mode==="add" ? it.inv.quantity+it.qty : it.qty;
+        const newPrice = it.price==null ? it.inv.price : it.price;
+        detail=`${it.inv.quantity} → <b>${newQty}</b>${newPrice!==it.inv.price?` · ${money(it.inv.price)} → <b>${money(newPrice)}</b>`:` · ${money(newPrice)}`}`;
+      } else if(it.status==="new"||it.status==="newmed"){
+        detail=`<b>${it.qty}</b> @ ${money(it.price)}`;
+      } else detail=`<span style="color:var(--out)">${esc(it.note)}</span>`;
+      return `<tr>
+        <td style="color:var(--faint)">${it.line}</td>
+        <td><b>${esc(it.displayName||it.name||"—")}</b>${it.status==="newmed"?`<br><small style="color:var(--muted)">${esc(it.generic||"")}</small>`:""}</td>
+        <td><span class="pill ${STATUS[it.status].pill}">${STATUS[it.status].label}</span></td>
+        <td>${detail}</td></tr>`;
+    }).join("");
+    $("imp-table").innerHTML=rows;
+    const ok=plan.filter(x=>["new","update","newmed"].includes(x.status)).length;
+    const go=$("imp-go"); go.disabled=!ok; go.textContent = ok ? `Import ${ok} item${ok!==1?'s':''}` : "Nothing to import";
+  };
+
+  openModal(`
+    <h3>Check before importing</h3>
+    <p class="sub">${esc(fileName)} · ${plan.length} row${plan.length!==1?'s':''}${truncated?` (only the first ${IMPORT_MAX_ROWS} are used)`:""}</p>
+    ${guessed?`<div class="hint" style="margin:0 0 12px">⚠️ No header row found — reading columns as <b>name, quantity, price, generic, manufacturer</b>.</div>`:""}
+    <div class="imp-summary">
+      <span class="pill approved">${n("new")} new stock</span>
+      <span class="pill pending">${n("update")} updates</span>
+      <span class="pill neutral">${n("newmed")} new to catalog</span>
+      ${n("error")?`<span class="pill suspended">${n("error")} errors (skipped)</span>`:""}
+      ${n("skip")?`<span class="pill neutral">${n("skip")} duplicates</span>`:""}
+    </div>
+    ${n("update")?`
+    <label class="fld" style="margin-top:12px"><span class="lab">For medicines you already stock</span>
+      <select class="input" id="imp-mode">
+        <option value="set">Replace quantity with the file's quantity</option>
+        <option value="add">Add the file's quantity to current stock (restock)</option>
+      </select></label>`:""}
+    <div class="table-wrap imp-wrap"><table>
+      <thead><tr><th>Row</th><th>Medicine</th><th>Action</th><th>Change</th></tr></thead>
+      <tbody id="imp-table"></tbody>
+    </table></div>
+    <div class="err" id="imp-err2" style="margin-top:10px"></div>
+    <div id="imp-progress" class="imp-progress" hidden><div class="bar"><span id="imp-bar"></span></div><small id="imp-ptext"></small></div>
+    <div class="row" style="justify-content:space-between; margin-top:14px">
+      <button class="btn ghost" id="imp-back">← Choose another file</button>
+      <button class="btn primary" id="imp-go">Import</button>
+    </div>`, { wide:true });
+
+  draw();
+  if($("imp-mode")) $("imp-mode").onchange=draw;
+  $("imp-back").onclick=openStockImport;
+  $("imp-go").onclick=()=>runImport(plan, $("imp-mode")?.value||"set");
+}
+
+async function runImport(plan, mode){
+  const ph=myPharmacy();
+  const todo=plan.filter(x=>["new","update","newmed"].includes(x.status));
+  const go=$("imp-go"), back=$("imp-back"); go.disabled=true; back.disabled=true;
+  const prog=$("imp-progress"); prog.hidden=false;
+  let done=0, failed=[];
+  const total=todo.length + todo.filter(x=>x.status==="newmed").length;
+  const tick=()=>{ done++; $("imp-bar").style.width=Math.round(done/total*100)+"%"; $("imp-ptext").textContent=`Saving ${done} of ${total}…`; };
+  const inChunks=async (items, fn)=>{ for(let i=0;i<items.length;i+=10){ await Promise.all(items.slice(i,i+10).map(fn)); } };
+
+  // 1) add medicines that aren't in the catalog yet (id = name key, so no duplicates)
+  const newMeds=todo.filter(x=>x.status==="newmed");
+  await inChunks(newMeds, async (it)=>{
+    const ref=doc(db,"medicines",it.key);
+    try{
+      const existing=await getDoc(ref);
+      if(!existing.exists()){
+        await setDoc(ref, { name:it.name.slice(0,100), generic:(it.generic||"—").slice(0,120),
+          mfr:(it.mfr||"—").slice(0,100), nameKey:it.key, addedBy:ME.uid });
+      }
+      it.medicineId=it.key;
+    }catch(e){ console.error(e); it.failed="Couldn't add to catalog"; failed.push(it); }
+    tick();
+  });
+
+  // 2) write stock
+  await inChunks(todo.filter(x=>!x.failed), async (it)=>{
+    try{
+      if(it.status==="update"){
+        const patch={};
+        if(it.qty!=null) patch.quantity = mode==="add" ? it.inv.quantity + it.qty : it.qty;
+        if(it.price!=null) patch.price = it.price;
+        if(Object.keys(patch).length) await updateDoc(doc(db,"inventory",it.inv.id), patch);
+      } else {
+        await setDoc(doc(db,"inventory",`${ph.id}_${it.medicineId}`),
+          { pharmacyId:ph.id, ownerUserId:ME.uid, medicineId:it.medicineId, quantity:it.qty, price:it.price });
+      }
+    }catch(e){ console.error(e); it.failed = e.code==="permission-denied" ? "Refused by database rules" : "Save failed"; failed.push(it); }
+    tick();
+  });
+
+  const ok=todo.length-failed.length;
+  if(!failed.length){
+    closeModal();
+    toast(`Imported ${ok} item${ok!==1?'s':''} into your inventory.`, "good");
+    return;
+  }
+  $("imp-ptext").textContent=`Imported ${ok}, ${failed.length} failed.`;
+  $("imp-err2").innerHTML = `<b>${failed.length} row(s) didn't save:</b> ` +
+    failed.slice(0,8).map(f=>`row ${f.line} (${esc(f.displayName||f.name)}: ${esc(f.failed)})`).join(", ") +
+    (failed.length>8?"…":"") +
+    (failed.some(f=>f.failed==="Refused by database rules") ? "<br>Make sure the latest <code>firestore.rules</code> are published." : "");
+  back.disabled=false; go.textContent="Done"; go.disabled=false; go.onclick=closeModal;
 }
 
 function editInventory(invId){
@@ -1723,7 +2042,7 @@ function viewAdMedicines(){
         return `<tr>
           <td><b>${esc(m.name)}</b></td>
           <td style="color:var(--muted)">${esc(m.generic)}</td>
-          <td>${esc(m.mfr)}</td>
+          <td>${esc(m.mfr)}${m.addedBy?` <span class="pill neutral" title="Added by a pharmacy during stock import">shop-added</span>`:""}</td>
           <td>${listings} pharmac${listings!==1?'ies':'y'}</td>
           <td style="text-align:right; white-space:nowrap">
             <button class="btn sm ghost" data-edit-med="${m.id}">Edit</button>

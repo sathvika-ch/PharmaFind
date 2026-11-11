@@ -54,6 +54,32 @@ Open the printed address (e.g. `http://localhost:3000`).
   Limit: **8 different medicines per bill** (a rules limit — start a second bill for more).
 - Bills can never be edited or deleted.
 
+## Bulk stock import (CSV / Excel)
+
+Medical shop → **Inventory → ⬆ Import CSV / Excel**.
+
+- Columns: `name`, `quantity`, `price` (optional `generic`, `manufacturer`). Headings like *Medicine, Qty, Stock,
+  MRP, Rate, Salt, Company* are recognised too. `₹` signs and commas in prices are fine.
+- A preview shows every row as **New stock / Update / New medicine / Error** before anything is saved.
+- For medicines already stocked you choose: **replace** quantity, or **add** to it (restock).
+- Medicines missing from the catalog are added automatically (marked *shop-added* in the admin catalog).
+- Try it with `sample-stock.xlsx`, or use **Download template** in the import window.
+- Excel files are read with SheetJS loaded from `cdn.sheetjs.com` (needs internet). CSV works offline.
+
+## Separate entry pages (portals)
+
+The app opens on **"Who are you?"** with three choices. Each has its own link you can share:
+
+| Who | Link |
+|---|---|
+| Patients | `your-site/#/patient` |
+| Medical shops | `your-site/#/pharmacy` |
+| Admin | `your-site/#/admin` |
+
+- New accounts get the role of the portal they signed up from (no extra picker).
+- Signing in through the wrong portal shows "This is a Patient account" with a button to open the right dashboard.
+- The admin portal only accepts emails in `ADMIN_EMAILS` / `adminEmails()`.
+
 ## Google sign-in notes
 
 - Works on `localhost` and on any domain listed under **Authorized domains** (add your GitHub Pages domain, e.g. `yourname.github.io`).
