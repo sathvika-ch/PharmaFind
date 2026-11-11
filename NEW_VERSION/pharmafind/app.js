@@ -258,8 +258,16 @@ async function routeSignedIn(user){
   catch(e){ console.error(e); completingLink=false; renderLoadError(user, e); return; }
 
   completingLink=false;
+  const portal = hashPortal() || storedPortal();
   if(snap.exists()){
     const d=snap.data();
+    if(portal && d.role && portal!==d.role && ["patient","pharmacy","admin"].includes(d.role)){
+      renderPortalMismatch(user, d.role, portal); return;
+    }
+    if(d.role && PORTALS[d.role] && hashPortal()!==d.role){
+      try{ localStorage.setItem(PORTAL_KEY, d.role); }catch(_){}
+      window.history.replaceState({}, document.title, window.location.pathname + "#/" + d.role);
+    }
     ME = { uid:user.uid, role:d.role, name:d.name||"", email:d.email||user.email||"",
            phone:d.phone||"", address:d.address||"" };
     if(!["patient","pharmacy","admin"].includes(ME.role)){
@@ -268,9 +276,39 @@ async function routeSignedIn(user){
     state.view=null; state.searchQuery=""; state.billDraft=[];
     setupListeners();
     renderApp();
+  } else if(portal==="admin" && !isAdminEmail(user.email)){
+    renderNotAdmin(user);
   } else {
-    renderProfileSetup(user);
+    renderProfileSetup(user, portal);
   }
+}
+
+function renderPortalMismatch(user, role, portal){
+  const R=PORTALS[role], P=PORTALS[portal];
+  $("root").innerHTML=`<div class="auth-wrap"><div class="auth-card" style="text-align:center">
+    ${BRAND}
+    <div style="font-size:38px; margin:16px 0 6px">${R.ic}</div>
+    <h3 class="auth-title">This is a ${R.label} account</h3>
+    <p class="auth-sub">You opened the <b>${P.label}</b> sign-in, but <b>${esc(user.email)}</b> is registered as a
+      <b>${R.label}</b>. Each account has one role.</p>
+    <button class="btn primary big" id="pm-open" style="width:100%">Open my ${R.label} dashboard</button>
+    <button class="btn ghost" id="pm-out" style="width:100%; margin-top:8px">Sign out & use another account</button>
+  </div></div>`;
+  $("pm-open").onclick=()=>{ setPortal(role); renderLoading("Loading…"); routeSignedIn(user); };
+  $("pm-out").onclick=logout;
+}
+
+function renderNotAdmin(user){
+  $("root").innerHTML=`<div class="auth-wrap"><div class="auth-card" style="text-align:center">
+    ${BRAND}
+    <div style="font-size:38px; margin:16px 0 6px">🛡️</div>
+    <h3 class="auth-title">Not an admin account</h3>
+    <p class="auth-sub"><b>${esc(user.email)}</b> isn't on the admin list, so it can't open the admin portal.</p>
+    <button class="btn primary big" id="na-out" style="width:100%">Sign out & try another account</button>
+    <button class="btn ghost" id="na-pat" style="width:100%; margin-top:8px">Continue as a patient instead</button>
+  </div></div>`;
+  $("na-out").onclick=logout;
+  $("na-pat").onclick=()=>{ setPortal("patient"); renderLoading("Loading…"); routeSignedIn(user); };
 }
 
 function renderLoadError(user, e){
@@ -310,6 +348,69 @@ function renderLoading(msg){
 
 const BRAND = `<div class="brand"><span class="mark"><span>✚</span></span> PharmaFind</div>`;
 
+/* ---------- Portals: separate entry pages for each kind of user ---------- */
+const PORTAL_KEY = "pf_portal";
+const PORTALS = {
+  patient:{ ic:"🧑", label:"Patient", who:"I need medicines",
+    desc:"Find medicines in stock near you, reserve and pay online.",
+    title:"Patient sign-in", sub:"Sign in or create your patient account with one tap." },
+  pharmacy:{ ic:"🏥", label:"Medical shop", who:"I run a medical shop",
+    desc:"List your stock, create bills and handle reservations.",
+    title:"Medical shop sign-in", sub:"Sign in to your store, or register a new medical shop. New shops go live after the admin approves them." },
+  admin:{ ic:"🛡️", label:"Admin", who:"I'm the admin",
+    desc:"Approve shops, manage the medicine catalog and all accounts.",
+    title:"Admin sign-in", sub:"Only approved admin accounts can sign in here." },
+};
+const ROLE_NAME = { patient:"Patient", pharmacy:"Medical shop", admin:"Admin" };
+
+function hashPortal(){
+  const h=(window.location.hash||"").replace(/^#\/?/,"").toLowerCase();
+  return PORTALS[h] ? h : null;
+}
+function storedPortal(){
+  try{ const v=localStorage.getItem(PORTAL_KEY); return PORTALS[v] ? v : null; }catch(_){ return null; }
+}
+function setPortal(p){
+  try{ p ? localStorage.setItem(PORTAL_KEY, p) : localStorage.removeItem(PORTAL_KEY); }catch(_){}
+  const url = window.location.pathname + window.location.search + (p ? "#/"+p : "");
+  window.history.pushState({}, document.title, url);
+}
+window.addEventListener("hashchange", ()=>{
+  if(!auth.currentUser && !completingLink) renderAuth();
+});
+window.addEventListener("popstate", ()=>{
+  if(!auth.currentUser && !completingLink) renderAuth();
+});
+
+function renderPortalChooser(){
+  $("root").innerHTML=`
+  <div class="auth-wrap">
+    <div class="auth-card">
+      ${BRAND}
+      <p class="tag">Find medicines in stock at pharmacies near you — and reserve them before you go.</p>
+      <h3 class="auth-title" style="text-align:center">Welcome! Who are you?</h3>
+      <p class="auth-sub" style="text-align:center">Pick one to continue.</p>
+      <div class="portal-list">
+        ${Object.entries(PORTALS).map(([k,p])=>`
+          <button class="portal-card ${k==='admin'?'subtle':''}" data-portal="${k}">
+            <span class="pc-ic">${p.ic}</span>
+            <span class="pc-body"><b>${p.who}</b><small>${p.desc}</small></span>
+            <span class="pc-go">›</span>
+          </button>`).join("")}
+      </div>
+    </div>
+  </div>`;
+  $("root").querySelectorAll("[data-portal]").forEach(b=>b.onclick=()=>{ setPortal(b.dataset.portal); renderAuth(); });
+}
+
+function portalHeader(k){
+  const p=PORTALS[k];
+  return `<div class="portal-top">
+    <button class="back-link" id="au-back">← Back</button>
+    <span class="portal-chip">${p.ic} ${p.label}</span>
+  </div>`;
+}
+
 function stepsHtml(active){
   const steps=["Enter your email","Open the link we email you","You're signed in"];
   return `<ol class="steps">${steps.map((t,i)=>`
@@ -319,14 +420,16 @@ function stepsHtml(active){
 const GOOGLE_G = `<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-7.9l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>`;
 
 function renderAuth(prefill="", showEmail=false){
+  const portal=hashPortal();
+  if(!portal){ renderPortalChooser(); return; }
+  const P=PORTALS[portal];
   $("root").innerHTML = `
   <div class="auth-wrap">
     <div class="auth-card">
+      ${portalHeader(portal)}
       ${BRAND}
-      <p class="tag">Find medicines in stock at pharmacies near you — and reserve them before you go.</p>
-
-      <h3 class="auth-title">Sign in or create an account</h3>
-      <p class="auth-sub">One tap with your Google account. New here? Your account is created automatically.</p>
+      <h3 class="auth-title" style="text-align:center; margin-top:14px">${P.title}</h3>
+      <p class="auth-sub" style="text-align:center">${P.sub}</p>
 
       <button class="btn google big" id="au-google" style="width:100%">${GOOGLE_G}<span>Continue with Google</span></button>
       <div class="err" id="au-gerr" style="margin-top:10px"></div>
@@ -342,9 +445,10 @@ function renderAuth(prefill="", showEmail=false){
       ` : `
       <button class="btn ghost" id="au-showemail" style="width:100%">Use an email link instead</button>`}
 
-      <p class="fine">🔒 We only use your name and email. No password to remember.</p>
+      <p class="fine">${portal==="admin" ? "🔒 Admin access is limited to approved emails." : "🔒 We only use your name and email. No password to remember."}</p>
     </div>
   </div>`;
+  $("au-back").onclick=()=>{ setPortal(null); renderAuth(); };
   $("au-google").onclick=googleSignIn;
   if(showEmail){
     const emailEl=$("au-email");
@@ -362,6 +466,7 @@ const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt:"select_account" });
 
 async function googleSignIn(){
+  const hp=hashPortal(); if(hp){ try{ localStorage.setItem(PORTAL_KEY, hp); }catch(_){} }
   const btn=$("au-google"), err=$("au-gerr");
   if(err) err.textContent="";
   if(btn){ btn.disabled=true; btn.querySelector("span").textContent="Opening Google…"; }
@@ -415,7 +520,7 @@ async function sendLink(email, fromResend=false){
   if(btn){ btn.disabled=true; btn.textContent="Sending…"; }
   try{
     await sendSignInLinkToEmail(auth, email, actionCodeSettings());
-    try{ localStorage.setItem(EMAIL_KEY, email); }catch(_){}
+    try{ localStorage.setItem(EMAIL_KEY, email); const hp=hashPortal(); if(hp) localStorage.setItem(PORTAL_KEY, hp); }catch(_){}
     renderCheckInbox(email);
     if(fromResend) toast("New link sent.", "good");
   }catch(e){
@@ -478,7 +583,8 @@ async function handleEmailLinkReturn(){
   if(!email){ email = (window.prompt("Please confirm your email to finish signing in:") || "").trim(); }
   if(!email){
     completingLink=false;
-    window.history.replaceState({}, document.title, window.location.pathname);
+    const sp=storedPortal();
+    window.history.replaceState({}, document.title, window.location.pathname + (sp ? "#/"+sp : ""));
     toast("Sign-in cancelled — enter your email to get a new link.", "bad");
     renderAuth(); return;
   }
@@ -493,20 +599,22 @@ async function handleEmailLinkReturn(){
       : "That sign-in link is invalid or expired. Please request a new one.", "bad");
     if(!auth.currentUser) renderAuth();
   }finally{
-    window.history.replaceState({}, document.title, window.location.pathname);
+    const p=storedPortal();
+    window.history.replaceState({}, document.title, window.location.pathname + (p ? "#/"+p : ""));
   }
 }
 
 /* ---------- First-time profile setup ---------- */
-function renderProfileSetup(user){
-  const forcedAdmin = isAdminEmail(user.email);
+function renderProfileSetup(user, fixedRole=null){
+  const forcedAdmin = fixedRole==="admin" || (!fixedRole && isAdminEmail(user.email));
+  const lockedRole = forcedAdmin ? "admin" : (fixedRole==="patient"||fixedRole==="pharmacy") ? fixedRole : null;
   let setupLoc = { ...DEFAULT_LOC, set:false };
 
   $("root").innerHTML=`
   <div class="auth-wrap">
     <div class="auth-card">
       <div class="brand"><span class="mark"><span>✚</span></span> PharmaFind</div>
-      <div class="signed-badge"><span>✓ Email confirmed</span></div>
+      <div class="signed-badge"><span>✓ Signed in</span></div>
       <h3 class="auth-title">You're in! One last step</h3>
       <p class="auth-sub">Signed in as <b>${esc(user.email)}</b>. Tell us a little about you — you only do this once.</p>
 
@@ -514,7 +622,12 @@ function renderProfileSetup(user){
         <input class="input" id="ps-name" placeholder="Your name" maxlength="80" value="${esc(user.displayName||"")}"></label>
 
       ${forcedAdmin ? `
-        <div class="hint" style="margin:0 0 16px"><b>Admin account.</b> Your email is on the admin list, so you'll manage the whole network.</div>
+        <div class="hint" style="margin:0 0 16px"><b>🛡️ Admin account.</b> Your email is on the admin list, so you'll manage the whole network.</div>
+      ` : lockedRole ? `
+      <div class="hint" style="margin:0 0 16px">Creating a <b>${PORTALS[lockedRole].ic} ${PORTALS[lockedRole].label}</b> account.
+        <a href="#" id="ps-switch">Wrong type?</a></div>
+      <input type="hidden" id="ps-role" value="${lockedRole}">
+      <div id="ps-ph"></div>
       ` : `
       <div class="fld"><span class="lab">How will you use PharmaFind?</span>
         <input type="hidden" id="ps-role" value="patient">
@@ -528,7 +641,7 @@ function renderProfileSetup(user){
       <div id="ps-ph"></div>`}
 
       <div class="err" id="ps-err"></div>
-      <button class="btn primary big" id="ps-go" style="width:100%">Finish & open PharmaFind</button>
+      <button class="btn primary big" id="ps-go" style="width:100%">${lockedRole==="pharmacy" ? "Register my shop" : "Finish & open PharmaFind"}</button>
       <button class="btn ghost" id="ps-cancel" style="width:100%; margin-top:8px">Not you? Sign out</button>
     </div>
   </div>`;
@@ -558,6 +671,8 @@ function renderProfileSetup(user){
         lb.disabled=false; lb.textContent="📍 Use my current location";
       };
     };
+    const sw=$("ps-switch");
+    if(sw) sw.onclick=(e)=>{ e.preventDefault(); setPortal(null); renderProfileSetup(user, null); };
     document.querySelectorAll("[data-role]").forEach(card=>card.onclick=()=>{
       roleSel.value=card.dataset.role;
       document.querySelectorAll("[data-role]").forEach(c=>c.classList.toggle("active", c===card));
@@ -587,6 +702,8 @@ function renderProfileSetup(user){
             lat:setupLoc.lat, lng:setupLoc.lng, status:"pending", createdAt:now() });
       }
       await batch.commit();
+      try{ localStorage.setItem(PORTAL_KEY, role); }catch(_){}
+      window.history.replaceState({}, document.title, window.location.pathname + "#/" + role);
       await routeSignedIn(user);
       toast("Account created — welcome!", "good");
     }catch(e){
@@ -979,9 +1096,9 @@ function openPayment(inv, med, ph, qty){
       showPaymentReceipt({ paymentRef, total:res.amountPaid, med, ph, qty });
     }catch(e){
       console.error(e);
-      err.textContent=(e.code==="permission-denied"
-        ? "The pharmacy can't take reservations right now."
-        : (e.message||"Reservation failed.")) + " You were not charged.";
+      err.innerHTML = e.code==="permission-denied"
+        ? `<b>The database refused this reservation.</b> This usually means the latest <code>firestore.rules</code> haven't been published in the Firebase console yet (or the store was just suspended). You were not charged.`
+        : esc(e.message||"Reservation failed.") + " You were not charged.";
       btn.disabled=false; btn.textContent="Pay "+money(total);
     }
   };
@@ -1330,7 +1447,7 @@ async function createBill(){
     });
   }catch(e){
     console.warn("bill aborted:", e);
-    toast((e.code==="permission-denied" ? "The database rejected this bill." : (e.message||"Bill cancelled.")) + " Nothing was changed.", "bad");
+    toast((e.code==="permission-denied" ? "The database rejected this bill — publish the latest firestore.rules in the Firebase console." : (e.message||"Bill cancelled.")) + " Nothing was changed.", "bad");
     viewPhBilling(); return;
   }
   lowList.forEach(x=> notify(ME.uid, `Low stock: ${x.name} — ${x.left} left`));
