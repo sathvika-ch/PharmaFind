@@ -2,8 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>PharmaFind — Medicine Availability & Pharmacy Finder</title>
+<meta name="description" content="Find medicines in stock at pharmacies near you, reserve and pay. Pharmacies manage stock and billing.">
+<meta name="theme-color" content="#0f8a6f">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/favicon.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
@@ -14,10 +19,13 @@
 <div id="toasts"></div>
 <div id="modal-root"></div>
 
-<!-- app.js is now an ES module (it imports the Firebase SDK + your config).
-     Modules must be served over http(s), so open the app through a local
-     server, e.g.  npx serve  or  python -m http.server  — opening the file
-     directly with file:// will NOT work. -->
+<!-- app.js is an ES module, so open the app through a web server
+     (npx serve / python -m http.server / Firebase Hosting) — not file://. -->
 <script type="module" src="app.js"></script>
+<script>
+  if ("serviceWorker" in navigator && location.protocol !== "file:") {
+    window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+  }
+</script>
 </body>
 </html>
