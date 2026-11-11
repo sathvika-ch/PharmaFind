@@ -28,6 +28,24 @@ import {
 
 import { firebaseConfig, ADMIN_EMAILS } from "./firebase-config.js";
 
+/* ---------- Keep the app on the same domain as Firebase sign-in ----------
+   Firebase Hosting serves this site on both <project>.web.app and
+   <project>.firebaseapp.com. Google sign-in runs on authDomain
+   (firebaseapp.com), so we always use that address — otherwise Chrome's
+   privacy protections can break sign-in inside the Android app. */
+(function(){
+  const h=window.location.hostname, auth=firebaseConfig.authDomain;
+  if(auth && h===firebaseConfig.projectId+".web.app"){
+    window.location.replace("https://"+auth+window.location.pathname+window.location.search+window.location.hash);
+  }
+})();
+
+/* running as an installed app (Android APK / home-screen app)? */
+const IS_INSTALLED_APP =
+  (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) ||
+  window.navigator.standalone === true ||
+  String(document.referrer).startsWith("android-app://");
+
 /* ---------- Firebase init ---------- */
 const app  = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -503,6 +521,12 @@ async function googleSignIn(){
   if(err) err.textContent="";
   if(btn){ btn.disabled=true; btn.querySelector("span").textContent="Opening Google…"; }
   try{
+    if(IS_INSTALLED_APP){
+      // inside the APK, a full-page Google sign-in is more reliable than a popup
+      renderLoading("Opening Google sign-in…");
+      await signInWithRedirect(auth, googleProvider);
+      return;
+    }
     await signInWithPopup(auth, googleProvider);
     // onAuthStateChanged takes it from here
   }catch(e){
@@ -510,6 +534,7 @@ async function googleSignIn(){
       try{ renderLoading("Opening Google sign-in…"); await signInWithRedirect(auth, googleProvider); return; }
       catch(e2){ e=e2; renderAuth(); }
     }
+    if(!$("au-google")) renderAuth();
     const quiet = ["auth/popup-closed-by-user","auth/cancelled-popup-request","auth/user-cancelled"].includes(e.code);
     if(!quiet) console.error(e);
     const errEl=$("au-gerr"), b=$("au-google");

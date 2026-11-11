@@ -1,0 +1,24 @@
+{
+  "name": "PharmaFind — Medicine Finder",
+  "short_name": "PharmaFind",
+  "description": "Find medicines in stock at pharmacies near you, reserve and pay. Pharmacies manage stock and billing.",
+  "id": "/",
+  "start_url": "/index.html",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0e1512",
+  "theme_color": "#0f8a6f",
+  "lang": "en-IN",
+  "categories": ["medical", "health", "shopping"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Find medicine", "url": "/index.html#/patient", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Medical shop", "url": "/index.html#/pharmacy", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}

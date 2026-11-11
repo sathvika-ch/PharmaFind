@@ -1,36 +1,40 @@
 rules_version = '2';
 
 /* ============================================================
-   PharmaFind — Firestore security rules
+   PharmaFind - Firestore security rules
    ------------------------------------------------------------
    These are the REAL access control. The JavaScript checks in the
-   app are only UI — THESE rules decide what is allowed.
+   app are only UI - THESE rules decide what is allowed.
 
    What they enforce:
-   • Users can only create their own profile, can't pick "admin"
-     unless their email is in adminEmails(), and can't change role.
-   • A pharmacy store doc id = its owner's uid (one store per user),
+   * ONE admin only: the email in adminEmails(). No one (not even the
+     admin) can make any other account an admin.
+   * Users can only create their own profile and can't change their role.
+   * A pharmacy store doc id = its owner's uid (one store per user),
      starts 'pending', and the owner can't self-approve.
-   • Inventory: owner edits price/stock. A PATIENT may only lower
+   * Inventory: owner edits price/stock. A PATIENT may only lower
      stock as part of creating a matching reservation (stock hold).
-   • Reservations: the amount must equal price × qty of the stock
+   * Reservations: the amount must equal price x qty of the stock
      actually held in the same transaction; store must be approved.
-     Pharmacy/admin can only move pending → fulfilled / cancelled.
-   • Bills: every line must match an inventory doc that was
+     Pharmacy/admin can only move pending -> fulfilled / cancelled.
+   * Bills: every line must match an inventory doc that was
      decremented by exactly that quantity IN THE SAME transaction,
      line totals and the bill total are recomputed and checked.
      Max 8 lines per bill. Bills can never be edited or deleted.
-   • Notifications: you can only notify yourself, the other party
+   * Medicines: admin manages the catalog; an approved pharmacy may ADD a
+     missing medicine while importing stock (no edits, no duplicates).
+   * Notifications: you can only notify yourself, the other party
      of a reservation you're part of, or anyone if you're admin.
 
    HOW TO APPLY:
-     Firebase console → Firestore Database → Rules → paste → Publish.
+     Firebase console -> Firestore Database -> Rules -> paste -> Publish.
    ============================================================ */
 
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // 🔽 Must match ADMIN_EMAILS in firebase-config.js (lowercase) 🔽
+    // THE ONE ADMIN of PharmaFind. Only this email can ever be admin.
+    // Must match ADMIN_EMAILS in firebase-config.js (lowercase).
     function adminEmails() {
       return ['chavanaboinasathvika@gmail.com'];
     }
@@ -45,8 +49,11 @@ service cloud.firestore {
 
     function isAdminEmail() { return myEmail() in adminEmails(); }
 
+    // admin = the admin email AND a users doc with role 'admin'.
+    // A doc that says 'admin' for any other email is NOT treated as admin.
     function isAdmin() {
       return signedIn()
+        && isAdminEmail()
         && exists(/databases/$(database)/documents/users/$(request.auth.uid))
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
     }
@@ -69,23 +76,52 @@ service cloud.firestore {
         && d.address is string && d.address.size() <= 200;
     }
 
+    // nobody - not even the admin - can give the admin role to another email
+    function roleAllowed(d) {
+      return d.role != 'admin'
+        || (d.email is string && d.email.lower() in adminEmails());
+    }
+
     match /users/{uid} {
       allow read:   if signedIn() && (request.auth.uid == uid || isAdmin());
       allow create: if signedIn()
+                    && roleAllowed(request.resource.data)
                     && ((request.auth.uid == uid && validNewUser(request.resource.data))
                         || isAdmin());
       allow update: if signedIn()
+                    && roleAllowed(request.resource.data)
                     && ((request.auth.uid == uid
                          && changed().hasOnly(['name', 'phone', 'address'])
                          && validProfile(request.resource.data))
+                        || (request.auth.uid == uid
+                            && isAdminEmail()
+                            && changed().hasOnly(['role'])
+                            && request.resource.data.role == 'admin')
                         || isAdmin());
       allow delete: if isAdmin();
     }
 
     /* ================= medicines (public catalog) ================= */
+    // An APPROVED pharmacy may add a missing medicine while importing stock.
+    // Doc id must equal the normalised name key, so the same medicine can
+    // never be added twice (a second create on that id is denied).
+    function pharmacyAddsMedicine(medId) {
+      let d = request.resource.data;
+      let ph = get(/databases/$(database)/documents/pharmacies/$(request.auth.uid)).data;
+      return d.keys().hasOnly(['name', 'generic', 'mfr', 'nameKey', 'addedBy'])
+        && d.addedBy == request.auth.uid
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 100
+        && d.generic is string && d.generic.size() <= 120
+        && d.mfr is string && d.mfr.size() <= 100
+        && d.nameKey is string && medId == d.nameKey
+        && ph.ownerUserId == request.auth.uid
+        && ph.status == 'approved';
+    }
+
     match /medicines/{id} {
-      allow read:  if true;
-      allow write: if isAdmin();
+      allow read:   if true;
+      allow create: if signedIn() && (pharmacyAddsMedicine(id) || isAdmin());
+      allow update, delete: if isAdmin();
     }
 
     /* ================= pharmacies ================= */

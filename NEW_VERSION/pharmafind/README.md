@@ -13,6 +13,10 @@ Firebase Auth (**Continue with Google**, with email link as a backup) + Cloud Fi
 | `firebase-config.js` | Firebase keys + `ADMIN_EMAILS` |
 | `firestore.rules` | Security rules — **paste into the Firebase console** |
 | `seed.html` | Admin-only demo data loader (catalog + sample stock) |
+| `manifest.webmanifest`, `sw.js`, `icons/` | Make the site installable — needed for the Android app |
+| `firebase.json`, `.firebaserc` | `firebase deploy` uploads the site **and** publishes the rules |
+| `.well-known/assetlinks.json` | Links the Android app to the site (fill in after PWABuilder) |
+| `DEPLOY_APK.md` | **Step-by-step: website online → APK → GitHub release** |
 
 ## One-time Firebase console setup
 
@@ -21,7 +25,7 @@ Firebase Auth (**Continue with Google**, with email link as a backup) + Cloud Fi
 2. **Authentication → Settings → Authorized domains** → make sure the address you open the app from is listed
    (`localhost` is there by default; add your GitHub Pages / hosting domain when you deploy).
 3. **Firestore Database → Rules** → paste all of `firestore.rules` → **Publish**.
-4. Admin email: it must be the same in **both** `firebase-config.js` (`ADMIN_EMAILS`) and `firestore.rules` (`adminEmails()`), in lowercase.
+4. **One admin only.** The admin email must be the same in **both** `firebase-config.js` (`ADMIN_EMAILS`) and `firestore.rules` (`adminEmails()`), in lowercase. The rules make sure no other account can ever become admin — not even if the admin tries. That email becomes admin automatically whichever portal it signs in from.
 
 ## Run locally
 
@@ -84,9 +88,9 @@ The app opens on **"Who are you?"** with three choices. Each has its own link yo
 
 - Works on `localhost` and on any domain listed under **Authorized domains** (add your GitHub Pages domain, e.g. `yourname.github.io`).
 - If the browser blocks the popup, the app automatically switches to a full-page Google redirect.
-- **Android APK (WebView):** Google blocks its sign-in page inside plain WebViews. When you wrap this as an app,
-  use a wrapper with a native Google sign-in plugin (e.g. Capacitor + `@capacitor-firebase/authentication`),
-  or keep the email-link option for the app version.
+- **Android APK:** build it with PWABuilder (Trusted Web Activity) as described in `DEPLOY_APK.md`.
+  It runs on the phone's Chrome, so Google sign-in works (the app uses full-page sign-in instead of a popup).
+  Don't use a plain WebView wrapper — Google blocks sign-in inside those.
 
 ## Known limits (by design for a demo)
 
