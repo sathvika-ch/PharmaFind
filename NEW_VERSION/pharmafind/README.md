@@ -1,7 +1,7 @@
 # PharmaFind — setup guide
 
 Medicine availability & pharmacy finder. Roles: **Admin · Pharmacy · Patient**.
-Firebase Auth (passwordless email link) + Cloud Firestore (live data).
+Firebase Auth (**Continue with Google**, with email link as a backup) + Cloud Firestore (live data).
 
 ## Files
 
@@ -16,7 +16,8 @@ Firebase Auth (passwordless email link) + Cloud Firestore (live data).
 
 ## One-time Firebase console setup
 
-1. **Authentication → Sign-in method → Email/Password** → enable it **and** enable **Email link (passwordless sign-in)**.
+1. **Authentication → Sign-in method → Add new provider → Google** → Enable → pick a *project support email* → Save.
+   (Optional backup) **Email/Password** → enable it **and** enable **Email link (passwordless sign-in)**.
 2. **Authentication → Settings → Authorized domains** → make sure the address you open the app from is listed
    (`localhost` is there by default; add your GitHub Pages / hosting domain when you deploy).
 3. **Firestore Database → Rules** → paste all of `firestore.rules` → **Publish**.
@@ -35,11 +36,11 @@ Open the printed address (e.g. `http://localhost:3000`).
 
 ## Demo walkthrough
 
-1. Sign in with the **admin email** → name → you're admin.
-2. Sign in with a **second email** → choose *Pharmacy* → fill store details (tap 📍 to set its location).
+1. Tap **Continue with Google** with the **admin Google account** → you're admin.
+2. Sign in with a **second Google account** (or an email link) → choose *Pharmacy* → fill store details (tap 📍 to set its location).
 3. Back as admin, open **`seed.html`** on the same address → *Load sample catalog* → pick the pharmacy →
    *Add sample stock* (tick "approve"). Or do it by hand: Medicine catalog → Load sample; Approvals → Approve.
-4. Sign in with a **third email** as *Patient* → search "Dolo" → Reserve & pay (mock card, any numbers).
+4. Sign in with a **third account** as *Patient* → search "Dolo" → Reserve & pay (mock card, any numbers).
 5. As the pharmacy: Reservations → Mark fulfilled / Cancel; New bill → add items → Create bill.
 
 ## How stock stays correct
@@ -52,6 +53,14 @@ Open the printed address (e.g. `http://localhost:3000`).
   line lowered the matching inventory by exactly that quantity, at that price, and that the total adds up.
   Limit: **8 different medicines per bill** (a rules limit — start a second bill for more).
 - Bills can never be edited or deleted.
+
+## Google sign-in notes
+
+- Works on `localhost` and on any domain listed under **Authorized domains** (add your GitHub Pages domain, e.g. `yourname.github.io`).
+- If the browser blocks the popup, the app automatically switches to a full-page Google redirect.
+- **Android APK (WebView):** Google blocks its sign-in page inside plain WebViews. When you wrap this as an app,
+  use a wrapper with a native Google sign-in plugin (e.g. Capacitor + `@capacitor-firebase/authentication`),
+  or keep the email-link option for the app version.
 
 ## Known limits (by design for a demo)
 

@@ -122,7 +122,7 @@
   .grow{flex:1}
 
   label.fld{display:block; margin-bottom:14px}
-  label.fld .lab{font-size:13px; font-weight:600; color:var(--ink); margin-bottom:6px; display:block}
+  label.fld .lab, .fld .lab{font-size:13px; font-weight:600; color:var(--ink); margin-bottom:6px; display:block}
   .input, select.input{
     width:100%; padding:10px 12px; border:1px solid var(--border-strong); border-radius:var(--radius-sm);
     background:var(--surface); color:var(--ink); outline:none;
@@ -210,6 +210,43 @@
     padding:12px 14px; font-size:12.5px; color:var(--muted); margin-top:18px; line-height:1.7}
   .hint b{color:var(--ink)}
   .err{color:var(--out); font-size:13px; margin-top:-6px; margin-bottom:12px; min-height:0}
+
+
+  /* ---------- Auth: clearer onboarding ---------- */
+  .auth-card .tag{margin-bottom:20px}
+  .auth-title{font-size:19px; margin:0 0 4px}
+  .auth-sub{color:var(--muted); font-size:13.5px; margin:0 0 18px; line-height:1.55}
+  .btn.big{padding:13px 18px; font-size:15px}
+  .btn.google{background:#fff; color:#1f1f1f; border-color:#c6cbd0; gap:12px; box-shadow:0 1px 3px rgba(23,33,29,.12)}
+  .btn.google:hover{background:#f7f8f8; filter:none}
+  .or{display:flex; align-items:center; gap:12px; color:var(--faint); font-size:12.5px; margin:16px 0}
+  .or::before,.or::after{content:""; flex:1; height:1px; background:var(--border)}
+  .fine{text-align:center; color:var(--faint); font-size:12.5px; margin:14px 0 0}
+  .steps{list-style:none; margin:20px 0 0; padding:14px 14px 4px; border-radius:12px;
+    background:var(--surface-2); border:1px solid var(--border)}
+  .steps li{display:flex; align-items:center; gap:10px; font-size:13.5px; color:var(--muted); margin-bottom:10px}
+  .steps .num{width:24px; height:24px; border-radius:100px; display:grid; place-items:center; flex-shrink:0;
+    font-size:12px; font-weight:700; border:1.5px solid var(--border-strong); color:var(--muted)}
+  .steps li.now{color:var(--ink); font-weight:600}
+  .steps li.now .num{background:var(--primary); border-color:var(--primary); color:#fff}
+  .steps li.done .num{background:var(--primary-soft); border-color:var(--primary-soft); color:var(--primary)}
+  .signed-badge{display:flex; justify-content:center; margin:2px 0 16px}
+  .signed-badge span{font-size:12.5px; font-weight:600; padding:4px 12px; border-radius:100px; background:var(--ok-soft); color:var(--ok)}
+  .role-cards{margin-bottom:4px}
+  .inbox-ic{font-size:44px; text-align:center; margin:14px 0 4px}
+  .email-pill{display:inline-block; margin-top:6px; padding:4px 12px; border-radius:100px;
+    background:var(--primary-soft); color:var(--primary-dark); word-break:break-all}
+  .role-cards{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+  .role-card{display:flex; flex-direction:column; align-items:flex-start; gap:3px; text-align:left;
+    padding:14px; border-radius:12px; border:1.5px solid var(--border-strong); background:var(--surface);
+    color:var(--ink); cursor:pointer; font:inherit}
+  .role-card .rc-ic{font-size:22px; margin-bottom:4px}
+  .role-card b{font-size:14px}
+  .role-card small{color:var(--muted); font-size:12px; line-height:1.4}
+  .role-card:hover{border-color:var(--primary)}
+  .role-card.active{border-color:var(--primary); background:var(--primary-soft); box-shadow:0 0 0 3px var(--primary-soft)}
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .email-pill{color:var(--primary)} }
+  @media (max-width:420px){ .role-cards{grid-template-columns:1fr} .auth-card{padding:22px} }
 
   /* ---------- Toast ---------- */
   #toasts{position:fixed; bottom:22px; left:50%; transform:translateX(-50%); z-index:100;

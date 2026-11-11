@@ -19,6 +19,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
 import {
   getAuth, onAuthStateChanged, signOut,
   sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink,
+  GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult,
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
   getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc,
@@ -307,76 +308,164 @@ function renderLoading(msg){
     <p class="tag" style="margin-top:14px">${esc(msg||"Loading…")}</p></div></div>`;
 }
 
-function renderAuth(){
+const BRAND = `<div class="brand"><span class="mark"><span>✚</span></span> PharmaFind</div>`;
+
+function stepsHtml(active){
+  const steps=["Enter your email","Open the link we email you","You're signed in"];
+  return `<ol class="steps">${steps.map((t,i)=>`
+    <li class="${i<active?'done':i===active?'now':''}"><span class="num">${i<active?'✓':i+1}</span><span>${t}</span></li>`).join("")}</ol>`;
+}
+
+const GOOGLE_G = `<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-7.9l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>`;
+
+function renderAuth(prefill="", showEmail=false){
   $("root").innerHTML = `
   <div class="auth-wrap">
     <div class="auth-card">
-      <div class="brand"><span class="mark"><span>✚</span></span> PharmaFind</div>
-      <div class="tag">Sign in with your email — no password needed.</div>
+      ${BRAND}
+      <p class="tag">Find medicines in stock at pharmacies near you — and reserve them before you go.</p>
 
-      <label class="fld"><span class="lab">Email address</span>
-        <input class="input" id="au-email" type="email" placeholder="you@example.com" autocomplete="email"></label>
+      <h3 class="auth-title">Sign in or create an account</h3>
+      <p class="auth-sub">One tap with your Google account. New here? Your account is created automatically.</p>
+
+      <button class="btn google big" id="au-google" style="width:100%">${GOOGLE_G}<span>Continue with Google</span></button>
+      <div class="err" id="au-gerr" style="margin-top:10px"></div>
+
+      <div class="or"><span>or</span></div>
+
+      ${showEmail ? `
+      <label class="fld"><span class="lab">Sign in with an email link instead</span>
+        <input class="input" id="au-email" type="email" placeholder="you@example.com" autocomplete="email" value="${esc(prefill)}"></label>
       <div class="err" id="au-err"></div>
-      <button class="btn primary" id="au-go" style="width:100%">Email me a sign-in link</button>
+      <button class="btn" id="au-go" style="width:100%">Email me a sign-in link</button>
+      <p class="fine">We'll email you a link — tap it on this device to sign in. No password needed.</p>
+      ` : `
+      <button class="btn ghost" id="au-showemail" style="width:100%">Use an email link instead</button>`}
 
-      <div class="hint">
-        <b>How it works:</b> we email you a secure one-tap link. Click it and
-        you're in. First time? You'll pick whether you're a <b>patient</b> or a
-        <b>pharmacy</b> right after.
-      </div>
+      <p class="fine">🔒 We only use your name and email. No password to remember.</p>
     </div>
   </div>`;
-  const emailEl=$("au-email");
-  const go=()=>sendLink(emailEl.value.trim());
-  $("au-go").onclick=go;
-  emailEl.onkeydown=e=>{ if(e.key==="Enter") go(); };
-  emailEl.focus();
+  $("au-google").onclick=googleSignIn;
+  if(showEmail){
+    const emailEl=$("au-email");
+    const go=()=>sendLink(emailEl.value.trim());
+    $("au-go").onclick=go;
+    emailEl.onkeydown=e=>{ if(e.key==="Enter") go(); };
+    emailEl.focus();
+  } else {
+    $("au-showemail").onclick=()=>renderAuth(prefill, true);
+  }
 }
 
-function authErrorText(e){
+/* ---------- Google sign-in ---------- */
+const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt:"select_account" });
+
+async function googleSignIn(){
+  const btn=$("au-google"), err=$("au-gerr");
+  if(err) err.textContent="";
+  if(btn){ btn.disabled=true; btn.querySelector("span").textContent="Opening Google…"; }
+  try{
+    await signInWithPopup(auth, googleProvider);
+    // onAuthStateChanged takes it from here
+  }catch(e){
+    if(["auth/popup-blocked","auth/operation-not-supported-in-this-environment","auth/web-storage-unsupported"].includes(e.code)){
+      try{ renderLoading("Opening Google sign-in…"); await signInWithRedirect(auth, googleProvider); return; }
+      catch(e2){ e=e2; renderAuth(); }
+    }
+    const quiet = ["auth/popup-closed-by-user","auth/cancelled-popup-request","auth/user-cancelled"].includes(e.code);
+    if(!quiet) console.error(e);
+    const errEl=$("au-gerr"), b=$("au-google");
+    if(errEl && !quiet) errEl.textContent=authErrorText(e, "google");
+    if(b){ b.disabled=false; b.querySelector("span").textContent="Continue with Google"; }
+  }
+}
+
+/* finish a redirect-based Google sign-in (used when popups are blocked) */
+async function handleGoogleRedirectReturn(){
+  try{ await getRedirectResult(auth); }
+  catch(e){ console.error(e); toast(authErrorText(e, "google"), "bad"); }
+}
+
+function authErrorText(e, method="email"){
   switch(e && e.code){
     case "auth/unauthorized-continue-uri":
     case "auth/unauthorized-domain":
       return `This address (${window.location.hostname}) isn't in Firebase → Authentication → Settings → Authorized domains.`;
     case "auth/operation-not-allowed":
-      return "Email-link sign-in is off. Enable it in Firebase → Authentication → Sign-in method → Email/Password → Email link.";
+      return method==="google"
+        ? "Google sign-in is off. Enable it in Firebase → Authentication → Sign-in method → Google."
+        : "Email-link sign-in is off. Enable it in Firebase → Authentication → Sign-in method → Email/Password → Email link.";
+    case "auth/account-exists-with-different-credential":
+      return "This email already signed in another way. Use the email link option instead.";
+    case "auth/internal-error":
+      return "Google sign-in failed. Check your connection and try again.";
     case "auth/invalid-email": return "That email address looks invalid.";
     case "auth/quota-exceeded": return "Firebase's daily email limit was reached. Try again tomorrow.";
     case "auth/too-many-requests": return "Too many attempts. Wait a minute and try again.";
     case "auth/network-request-failed": return "No internet connection.";
-    default: return "Could not send the link. Check the email and try again.";
+    default: return method==="google" ? "Google sign-in didn't finish. Please try again." : "Could not send the link. Check the email and try again.";
   }
 }
 
-async function sendLink(email){
-  const err=$("au-err"); err.textContent="";
-  if(!email || !/^\S+@\S+\.\S+$/.test(email)){ err.textContent="Enter a valid email address."; return; }
-  const btn=$("au-go"); btn.disabled=true; btn.textContent="Sending…";
+async function sendLink(email, fromResend=false){
+  const err=$(fromResend?"ci-err":"au-err"); if(err) err.textContent="";
+  if(!email || !/^\S+@\S+\.\S+$/.test(email)){ if(err) err.textContent="Please type a full email address, like name@gmail.com."; return; }
+  const btn=$(fromResend?"ci-resend":"au-go"); const label=btn?btn.textContent:"";
+  if(btn){ btn.disabled=true; btn.textContent="Sending…"; }
   try{
     await sendSignInLinkToEmail(auth, email, actionCodeSettings());
     try{ localStorage.setItem(EMAIL_KEY, email); }catch(_){}
     renderCheckInbox(email);
+    if(fromResend) toast("New link sent.", "good");
   }catch(e){
     console.error(e);
-    err.textContent = authErrorText(e);
-    btn.disabled=false; btn.textContent="Email me a sign-in link";
+    if(err) err.textContent = authErrorText(e);
+    if(btn){ btn.disabled=false; btn.textContent=label; }
   }
 }
 
+function mailAppLink(email){
+  const d=String(email).split("@")[1]?.toLowerCase()||"";
+  if(d==="gmail.com"||d==="googlemail.com") return { name:"Gmail", url:"https://mail.google.com/mail/u/0/#search/PharmaFind" };
+  if(/^(outlook|hotmail|live|msn)\./.test(d)) return { name:"Outlook", url:"https://outlook.live.com/mail/" };
+  if(d.startsWith("yahoo.")) return { name:"Yahoo Mail", url:"https://mail.yahoo.com/" };
+  return null;
+}
+
+let resendTimer=null;
 function renderCheckInbox(email){
+  const mail=mailAppLink(email);
   $("root").innerHTML=`
   <div class="auth-wrap">
-    <div class="auth-card" style="text-align:center">
-      <div class="brand" style="justify-content:center"><span class="mark"><span>✚</span></span> PharmaFind</div>
-      <div style="font-size:40px; margin:16px 0 6px">📧</div>
-      <h3 style="font-family:var(--display)">Check your inbox</h3>
-      <p class="tag" style="margin-top:8px">We sent a sign-in link to<br><b>${esc(email)}</b></p>
-      <p style="font-size:13px; color:var(--muted); margin-top:14px">
-        Open it on <b>this device</b> and click the link. Not there? Check spam.</p>
-      <button class="btn" id="ci-back" style="width:100%; margin-top:18px">Use a different email</button>
+    <div class="auth-card">
+      ${BRAND}
+      <div class="inbox-ic">📧</div>
+      <h3 class="auth-title" style="text-align:center">Check your email</h3>
+      <p class="auth-sub" style="text-align:center">We sent a sign-in link to<br><b class="email-pill">${esc(email)}</b></p>
+
+      ${stepsHtml(1)}
+
+      <div class="hint" style="margin-top:6px">
+        <b>Open the email from PharmaFind and tap “Sign in”.</b><br>
+        Use <b>this same phone or computer</b> — the link signs you in here.<br>
+        Can't find it? Look in <b>Spam</b> or <b>Promotions</b>. It can take a minute.
+      </div>
+
+      ${mail?`<a class="btn primary big" style="width:100%; margin-top:16px; text-decoration:none" href="${mail.url}" target="_blank" rel="noopener">Open ${mail.name}</a>`:""}
+      <div class="err" id="ci-err" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:${mail?'8':'16'}px">
+        <button class="btn grow" id="ci-resend" disabled>Resend link</button>
+        <button class="btn ghost grow" id="ci-back">Wrong email?</button>
+      </div>
     </div>
   </div>`;
-  $("ci-back").onclick=renderAuth;
+  $("ci-back").onclick=()=>{ clearInterval(resendTimer); renderAuth(email, true); };
+  const rb=$("ci-resend"); let left=30;
+  const tickTxt=()=>{ rb.textContent = left>0 ? `Resend in ${left}s` : "Resend link"; rb.disabled = left>0; };
+  tickTxt(); clearInterval(resendTimer);
+  resendTimer=setInterval(()=>{ left--; if(!$("ci-resend")){ clearInterval(resendTimer); return; } tickTxt(); if(left<=0) clearInterval(resendTimer); },1000);
+  rb.onclick=()=>sendLink(email, true);
 }
 
 /* Called at boot: if the current URL is a sign-in link, finish signing in. */
@@ -417,25 +506,30 @@ function renderProfileSetup(user){
   <div class="auth-wrap">
     <div class="auth-card">
       <div class="brand"><span class="mark"><span>✚</span></span> PharmaFind</div>
-      <div class="tag">Welcome! Let's set up your account.</div>
-      <p style="font-size:13px; color:var(--muted); margin:-6px 0 16px">Signed in as <b>${esc(user.email)}</b></p>
+      <div class="signed-badge"><span>✓ Email confirmed</span></div>
+      <h3 class="auth-title">You're in! One last step</h3>
+      <p class="auth-sub">Signed in as <b>${esc(user.email)}</b>. Tell us a little about you — you only do this once.</p>
 
       <label class="fld"><span class="lab">Your full name</span>
-        <input class="input" id="ps-name" placeholder="Your name" maxlength="80"></label>
+        <input class="input" id="ps-name" placeholder="Your name" maxlength="80" value="${esc(user.displayName||"")}"></label>
 
       ${forcedAdmin ? `
         <div class="hint" style="margin:0 0 16px"><b>Admin account.</b> Your email is on the admin list, so you'll manage the whole network.</div>
       ` : `
-      <label class="fld"><span class="lab">I am a…</span>
-        <select class="input" id="ps-role">
-          <option value="patient">Patient — I want to find medicines</option>
-          <option value="pharmacy">Pharmacy — I want to list my store</option>
-        </select></label>
+      <div class="fld"><span class="lab">How will you use PharmaFind?</span>
+        <input type="hidden" id="ps-role" value="patient">
+        <div class="role-cards">
+          <button type="button" class="role-card active" data-role="patient">
+            <span class="rc-ic">🧑</span><b>I'm a patient</b><small>Search medicines, reserve &amp; pay</small></button>
+          <button type="button" class="role-card" data-role="pharmacy">
+            <span class="rc-ic">🏥</span><b>I run a pharmacy</b><small>List stock, billing, reservations</small></button>
+        </div>
+      </div>
       <div id="ps-ph"></div>`}
 
       <div class="err" id="ps-err"></div>
-      <button class="btn primary" id="ps-go" style="width:100%">Create my account</button>
-      <button class="btn ghost" id="ps-cancel" style="width:100%; margin-top:8px">Sign out</button>
+      <button class="btn primary big" id="ps-go" style="width:100%">Finish & open PharmaFind</button>
+      <button class="btn ghost" id="ps-cancel" style="width:100%; margin-top:8px">Not you? Sign out</button>
     </div>
   </div>`;
 
@@ -464,6 +558,11 @@ function renderProfileSetup(user){
         lb.disabled=false; lb.textContent="📍 Use my current location";
       };
     };
+    document.querySelectorAll("[data-role]").forEach(card=>card.onclick=()=>{
+      roleSel.value=card.dataset.role;
+      document.querySelectorAll("[data-role]").forEach(c=>c.classList.toggle("active", c===card));
+      drawPh();
+    });
     roleSel.onchange=drawPh; drawPh();
   }
 
@@ -497,7 +596,7 @@ function renderProfileSetup(user){
         : e.code==="permission-denied"
         ? "The database refused this — publish the latest firestore.rules."
         : "Could not create your account. Try again.";
-      btn.disabled=false; btn.textContent="Create my account";
+      btn.disabled=false; btn.textContent="Finish & open PharmaFind";
     }
   };
 }
@@ -1591,14 +1690,14 @@ function viewAdAccounts(){
   }).join("");
   $("main").innerHTML=`
     <div class="page-head"><h2>Accounts</h2>
-      <p>Everyone on the system. People onboard themselves with an email link.</p></div>
+      <p>Everyone on the system. People sign themselves up with Google (or an email link).</p></div>
     <div class="table-wrap"><table>
       <thead><tr><th>Name</th><th>Role</th><th>Email</th><th>Store</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
     <div class="hint" style="margin-top:16px">
-      <b>How accounts are created:</b> a person enters their email on the sign-in
-      screen, clicks the link we email them, and picks patient or pharmacy.
+      <b>How accounts are created:</b> a person taps “Continue with Google” (or uses an
+      email link) and then picks patient or pharmacy.
       To make someone an <b>admin</b>, add their email to <code>ADMIN_EMAILS</code>
       in firebase-config.js and to <code>adminEmails()</code> in firestore.rules.
       Deleting removes their profile, store, stock and notifications and cancels
@@ -1641,5 +1740,6 @@ async function deleteAccount(userId){
    BOOT
    ============================================================ */
 renderLoading("Loading…");
+handleGoogleRedirectReturn();
 handleEmailLinkReturn();   // if we arrived via an email link, finish sign-in;
                            // otherwise onAuthStateChanged shows sign-in or the app.
